@@ -1,5 +1,4 @@
 import Foundation
-import Security
 
 // MARK: - UsageService
 //
@@ -385,22 +384,42 @@ private enum UsageProbe {
         return CodexAuth(accessToken: token, accountId: tokens?["account_id"] as? String)
     }
 
-    // MARK: Keychain (read-only generic password)
+    // MARK: Keychain (read-only generic password, via the `security` CLI)
 
-    /// Read a generic-password Keychain item by service name. Triggers the standard
-    /// macOS access prompt the first time (the user clicks "Always Allow"); returns
-    /// nil if the item is missing or access is denied.
+    /// Read a generic-password Keychain item by service name.
+    ///
+    /// This spawns `/usr/bin/security find-generic-password -s <service> -w` instead of
+    /// calling `SecItemCopyMatching` from inside Cortex, and that distinction is the
+    /// whole point. "Claude Code-credentials" is owned by Claude Code, so any other
+    /// reader is challenged on first access. macOS binds the user's "Always Allow" to
+    /// the *requesting binary*: read it from Cortex directly and the grant is tied to
+    /// Cortex's code signature (which changes on every rebuild, so it never sticks and
+    /// the prompt returns forever). Route the read through the system `security` tool
+    /// and the grant is tied to `/usr/bin/security`, an Apple-signed binary whose
+    /// signature never changes, so "Always Allow" sticks permanently: one prompt, ever.
+    ///
+    /// `-w` prints only the password value to stdout. Returns nil if the item is
+    /// missing or access is denied (the caller then falls back to the file on disk).
     private static func readKeychain(service: String) -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var out: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data else { return nil }
-        return data
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-generic-password", "-s", service, "-w"]
+        let stdout = Pipe()
+        proc.standardOutput = stdout
+        proc.standardError = Pipe()  // swallow the "could not be found" stderr line
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        // `-w` appends a trailing newline; trim it and re-encode the JSON payload.
+        guard let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
+        else { return nil }
+        return Data(text.utf8)
     }
 
     // MARK: Parsing helpers
