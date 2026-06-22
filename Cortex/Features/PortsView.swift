@@ -16,6 +16,8 @@ struct PortsView: View {
 
     // Search query applied to port / process / project / user.
     @State private var query = ""
+    // ⌘F focuses the search field (via model.focusSearchToken).
+    @FocusState private var searchFocused: Bool
 
     // Common local dev-server range surfaced under its own header.
     private let devRange = 3000...3010
@@ -25,6 +27,8 @@ struct PortsView: View {
             .navigationTitle("Ports")
             .navigationSubtitle(subtitleText)
             .searchable(text: $query, prompt: "Search ports")
+            .searchFocused($searchFocused)
+            .onChange(of: model.focusSearchToken) { _, _ in searchFocused = true }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {

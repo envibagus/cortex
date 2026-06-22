@@ -9,6 +9,9 @@ import AppKit
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    // Sidebar column visibility, toggled by ⌘\ (via model.sidebarToggleToken). The
+    // system toolbar toggle still drives it too.
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
         ZStack {
@@ -26,7 +29,7 @@ struct ContentView: View {
 
     // The main two-column shell plus the ⌘K command palette overlay.
     private var mainShell: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 208, ideal: 224, max: 280)
         } detail: {
@@ -89,6 +92,10 @@ struct ContentView: View {
         // Hide only the "Cortex" title text (keeps the standard window style so the
         // sidebar stays flush; the title-bar height itself is unchanged).
         .background(WindowConfigurator())
+        // ⌘\ toggles the sidebar column.
+        .onChange(of: model.sidebarToggleToken) { _, _ in
+            columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
+        }
         // Keep the live usage limits fresh while the app is open: re-probe every 5
         // minutes, but only once usage has been loaded at least once (so the first,
         // deferred Keychain prompt still waits until the user opens a usage view).

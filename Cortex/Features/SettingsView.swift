@@ -73,6 +73,10 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .frame(minWidth: 520, idealWidth: 600, minHeight: 520)
         .onAppear { syncDraftFromModel() }
+        // Esc leaves Settings: go back to the previous page (or Home if there's no history).
+        .onExitCommand {
+            if model.canGoBack { model.goBack() } else { model.route = .readout }
+        }
     }
 
     /// The grouped Form for the active tab. Each pane keeps its existing sections and
@@ -115,10 +119,10 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
         case .shortcuts:
             Form {
+                shortcutsNavSection
                 shortcutsGlobalSection
                 shortcutsPaletteSection
                 shortcutsEditorSection
-                shortcutsReplaySection
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
@@ -137,10 +141,28 @@ struct SettingsView: View {
     // applies. Each row pairs a plain-language action with its key caps. Update this
     // when shortcuts change (see the keyboard-shortcuts plan in memory for planned adds).
 
+    private var shortcutsNavSection: some View {
+        Section {
+            shortcutRow("Jump to a sidebar page", ["\u{2318}", "1-9"])
+            shortcutRow("Back", ["\u{2318}", "["])
+            shortcutRow("Forward", ["\u{2318}", "]"])
+            shortcutRow("Assistant", ["\u{2318}", "L"])
+            shortcutRow("Toggle sidebar", ["\u{2318}", "\\"])
+            shortcutRow("New item (Library pages)", ["\u{2318}", "N"])
+        } header: {
+            Text("Navigation")
+        } footer: {
+            Text("\u{2318}1 through \u{2318}9 follow the sidebar top to bottom, so they adapt when you pin or hide pages.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var shortcutsGlobalSection: some View {
         Section {
             shortcutRow("Command palette", ["\u{2318}", "K"])
+            shortcutRow("Find (focus the page's search)", ["\u{2318}", "F"])
             shortcutRow("Refresh all data", ["\u{2318}", "R"])
+            shortcutRow("Rescan the current page", ["\u{2318}", "\u{21E7}", "R"])
             shortcutRow("Settings", ["\u{2318}", ","])
         } header: {
             Text("Global")
@@ -167,16 +189,6 @@ struct SettingsView: View {
             Text("Markdown Editor")
         } footer: {
             Text("When editing a skill, agent, rule, or command.").foregroundStyle(.secondary)
-        }
-    }
-
-    private var shortcutsReplaySection: some View {
-        Section {
-            shortcutRow("Previous / next message", ["\u{2190}", "\u{2192}"])
-            shortcutRow("Play / pause", ["space"])
-            shortcutRow("Close replay", ["esc"])
-        } header: {
-            Text("Session Replay")
         }
     }
 

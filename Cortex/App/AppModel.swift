@@ -11,9 +11,53 @@ import AppKit
 @MainActor
 @Observable
 final class AppModel {
-    // Navigation
-    var route: Route = .readout
+    // Navigation. The didSet records route changes for ⌘[ / ⌘] history (back/forward
+    // set the route with isNavigatingHistory so they don't re-push).
+    var route: Route = .readout {
+        didSet {
+            guard !isNavigatingHistory, route != oldValue else { return }
+            if historyIndex < routeHistory.count - 1 {
+                routeHistory.removeSubrange((historyIndex + 1)...)
+            }
+            routeHistory.append(route)
+            historyIndex = routeHistory.count - 1
+        }
+    }
     var showCommandPalette = false
+
+    // Route history for ⌘[ (back) / ⌘] (forward).
+    private var routeHistory: [Route] = [.readout]
+    private var historyIndex = 0
+    private var isNavigatingHistory = false
+    var canGoBack: Bool { historyIndex > 0 }
+    var canGoForward: Bool { historyIndex < routeHistory.count - 1 }
+    func goBack() {
+        guard canGoBack else { return }
+        isNavigatingHistory = true; historyIndex -= 1; route = routeHistory[historyIndex]; isNavigatingHistory = false
+    }
+    func goForward() {
+        guard canGoForward else { return }
+        isNavigatingHistory = true; historyIndex += 1; route = routeHistory[historyIndex]; isNavigatingHistory = false
+    }
+
+    // ⌘F: bump this token; views with a search field observe it and focus theirs.
+    private(set) var focusSearchToken = 0
+    func focusSearch() { focusSearchToken += 1 }
+
+    // ⌘\: bump this token; ContentView observes it and flips the sidebar's visibility.
+    private(set) var sidebarToggleToken = 0
+    func toggleSidebar() { sidebarToggleToken += 1 }
+
+    /// The visible sidebar routes, top to bottom (pinned first, then each section's
+    /// routes), excluding hidden routes and Settings. ⌘1-9 bind to the first nine, so the
+    /// number matches the item's position in the sidebar (Home=1, Assistant=2, Skills=3, ...).
+    var sidebarVisibleRoutes: [Route] {
+        var out = pinnedRouteList.filter { !isHidden($0) }
+        for section in Sidebar.sections {
+            out.append(contentsOf: section.routes.filter { !isPinned($0) && !isHidden($0) })
+        }
+        return out
+    }
 
     // Assistant deep-link: a route an assistant CTA asked to open, plus an optional
     // search / scope for the destination to pre-apply when it appears. The target view
@@ -38,6 +82,32 @@ final class AppModel {
         guard pendingRoute == route else { return (nil, nil) }
         defer { pendingRoute = nil; pendingSearch = nil; pendingScope = nil }
         return (pendingSearch, pendingScope)
+    }
+
+    /// cmd+N: open the new-item creator for the current Library route's kind. No-op on
+    /// pages that don't create items (the creatable kinds are skill/agent/rule/command).
+    func newItemForCurrentRoute() {
+        switch route {
+        case .skills: newItemKind = .skill
+        case .agents: newItemKind = .agent
+        case .rules: newItemKind = .rule
+        case .commands: newItemKind = .command
+        default: break
+        }
+    }
+
+    /// ⌘⇧R: rescan just the data behind the current page (cheaper + more targeted than a
+    /// full refresh). Falls back to refreshAll on pages without a page-specific source.
+    func rescanCurrentPage() {
+        Task {
+            switch route {
+            case .ports: await ports.load()
+            case .live, .sessions, .readout: await sessions.load(); recomputeStats()
+            case .usage: if usage.hasLoaded { await usage.refresh() }
+            default: await refreshAll(); return
+            }
+            showToast("Rescanned")
+        }
     }
 
     // New-item creation flow.

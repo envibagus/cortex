@@ -39,6 +39,8 @@ struct AssistantView: View {
             }
         }
         .background(Theme.canvas)
+        // Opening Assistant (incl. via cmd+L) focuses the composer so you can type at once.
+        .onAppear { if model.chat.isAvailable { composerFocused = true } }
     }
 
     // MARK: - Header

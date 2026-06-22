@@ -48,12 +48,42 @@ struct CortexApp: App {
                 Button("Settings\u{2026}") { model.route = .settings }
                     .keyboardShortcut(",", modifiers: .command)
             }
-            // ⌘K opens the Spotlight-style command palette.
+            // ⌘N creates a new Library item for the current page (skill/agent/rule/command).
+            CommandGroup(replacing: .newItem) {
+                Button("New Item") { model.newItemForCurrentRoute() }
+                    .keyboardShortcut("n", modifiers: .command)
+            }
+            // ⌘\ toggles the sidebar, beside the system sidebar commands.
+            CommandGroup(after: .sidebar) {
+                Button("Toggle Sidebar") { model.toggleSidebar() }
+                    .keyboardShortcut("\\", modifiers: .command)
+            }
+            // ⌘K palette, ⌘F focus search, ⌘R refresh all, ⌘⇧R rescan the current page.
             CommandGroup(after: .toolbar) {
                 Button("Command Palette") { model.showCommandPalette.toggle() }
                     .keyboardShortcut("k", modifiers: .command)
+                Button("Find") { model.focusSearch() }
+                    .keyboardShortcut("f", modifiers: .command)
                 Button("Refresh") { Task { await model.refreshAll() } }
                     .keyboardShortcut("r", modifiers: .command)
+                Button("Rescan Page") { model.rescanCurrentPage() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+            }
+            // "Go": ⌘1-9 jump to the first nine sidebar pages (top to bottom), plus
+            // ⌘[ / ⌘] back/forward through route history and ⌘L to the Assistant.
+            CommandMenu("Go") {
+                ForEach(Array(model.sidebarVisibleRoutes.prefix(9).enumerated()), id: \.offset) { index, route in
+                    Button(route.title) { model.route = route }
+                        .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                }
+                Divider()
+                Button("Back") { model.goBack() }
+                    .keyboardShortcut("[", modifiers: .command).disabled(!model.canGoBack)
+                Button("Forward") { model.goForward() }
+                    .keyboardShortcut("]", modifiers: .command).disabled(!model.canGoForward)
+                Divider()
+                Button("Assistant") { model.route = .assistant }
+                    .keyboardShortcut("l", modifiers: .command)
             }
         }
     }

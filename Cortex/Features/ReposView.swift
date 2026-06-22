@@ -138,8 +138,11 @@ struct ReposView: View {
 // A Card-surfaced text field that matches the rest of the design system.
 
 private struct ReposSearchField: View {
+    @Environment(AppModel.self) private var model
     @Binding var query: String
     let placeholder: String
+    // ⌘F focuses this field (via model.focusSearchToken).
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -150,6 +153,7 @@ private struct ReposSearchField: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundStyle(Theme.textPrimary)
+                .focused($searchFocused)
             if !query.isEmpty {
                 Button {
                     query = ""
@@ -168,6 +172,7 @@ private struct ReposSearchField: View {
             RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
                 .strokeBorder(Theme.stroke, lineWidth: 1)
         )
+        .onChange(of: model.focusSearchToken) { _, _ in searchFocused = true }
     }
 }
 

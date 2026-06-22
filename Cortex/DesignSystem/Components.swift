@@ -496,11 +496,14 @@ enum LibrarySort: String, CaseIterable, Identifiable, FilterSortOption {
 // once there's more than one scope to pick, but the sort button always shows.
 
 struct LibraryFilterBar<Sort: FilterSortOption>: View {
+    @Environment(AppModel.self) private var model
     @Binding var query: String
     var placeholder: String
     @Binding var scope: String?
     var scopes: [String]
     @Binding var sort: Sort
+    // ⌘F focuses this field (via model.focusSearchToken).
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         if scopes.count > 1 {
@@ -536,6 +539,7 @@ struct LibraryFilterBar<Sort: FilterSortOption>: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 15))
                 .foregroundStyle(Theme.textPrimary)
+                .focused($searchFocused)
             if !query.isEmpty {
                 Button { query = "" } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -550,6 +554,7 @@ struct LibraryFilterBar<Sort: FilterSortOption>: View {
         .background(Theme.cardRaised, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
             .strokeBorder(Theme.strokeStrong, lineWidth: 1))
+        .onChange(of: model.focusSearchToken) { _, _ in searchFocused = true }
     }
 }
 
