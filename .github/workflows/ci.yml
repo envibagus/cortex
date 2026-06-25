@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Coverage note: a full `xcodebuild` needs the macOS 26 SDK (Xcode 26) because the UI
+# uses Liquid Glass APIs behind availability checks. GitHub-hosted runners do not ship
+# that SDK yet, so this workflow validates the project definition (the real gate) and
+# runs a best-effort build that is allowed to fail rather than implying full coverage.
+# Run a full build locally with `scripts/build.sh`.
+
+jobs:
+  validate:
+    name: Validate project
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks || true
+
+      - name: Build (best effort, may fail without the macOS 26 SDK)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild -project Cortex.xcodeproj -scheme Cortex \
+            -configuration Debug -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO build | tail -60
