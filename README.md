@@ -31,7 +31,13 @@ Grab the latest **[beta DMG from Releases](https://github.com/envibagus/cortex/r
 <!-- Add screenshots from a throwaway demo dataset with NO personal data.
      Suggested: docs/screenshots/home.png, sessions.png, costs.png, live.png -->
 
-_Screenshots coming soon._
+<img width="1152" height="931" alt="file-55c41aeef08b358aea0485922b2e8953" src="https://github.com/user-attachments/assets/957a308a-35a7-4fb3-a9c4-845afea31c76" />
+
+<img width="1152" height="931" alt="file-f6da8e86655ac07619c9e374dd8aed50" src="https://github.com/user-attachments/assets/d94fee48-fafb-48f1-8c35-88c0e2b935b2" />
+
+<img width="429" height="429" alt="image" src="https://github.com/user-attachments/assets/732f8b78-1f5a-417c-ad65-4eacf9791633" />
+
+
 
 ## What it does
 
