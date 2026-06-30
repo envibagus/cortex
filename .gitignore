@@ -1,0 +1,29 @@
+# Xcode / xcodegen
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+build/
+.build/
+*.swiftpm
+
+# macOS
+.DS_Store
+
+# Generated
+Cortex.xcodeproj/
+
+# SPM cloned packages
+.spm/
+
+# Secrets and signing material (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.mobileprovision
+secrets.*
+
+# Private working notes (personal; public agent guidance lives in AGENTS.md)
+CLAUDE.md

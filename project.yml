@@ -1,0 +1,53 @@
+# Cortex - xcodegen project definition.
+# SwiftUI + Swift Charts + MarkdownUI (for beautiful GitHub-flavored markdown).
+name: Cortex
+options:
+  bundleIdPrefix: com.cortex
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+configs:
+  Debug: debug
+  Release: release
+
+packages:
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    from: "2.4.0"
+  # Runtime SVG rendering for brand/tech-stack icons fetched from the thesvg CDN.
+  SwiftDraw:
+    url: https://github.com/swhitty/SwiftDraw
+    from: "0.16.0"
+
+targets:
+  Cortex:
+    type: application
+    platform: macOS
+    sources:
+      - path: Cortex
+    dependencies:
+      - package: MarkdownUI
+      - package: SwiftDraw
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cortex.app
+        PRODUCT_NAME: Cortex
+        MARKETING_VERSION: "1.2.0"
+        CURRENT_PROJECT_VERSION: 3
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Cortex
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.developer-tools"
+        INFOPLIST_KEY_LSMinimumSystemVersion: "15.0"
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Cortex contributors"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        COMBINE_HIDPI_IMAGES: YES
+        DEAD_CODE_STRIPPING: YES
