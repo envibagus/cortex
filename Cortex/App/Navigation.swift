@@ -2,8 +2,8 @@ import SwiftUI
 
 // MARK: - Routes
 //
-// One case per sidebar destination, grouped into sections that mirror the
-// reference layout: Overview, Monitor, Workspace, Config, Health.
+// One case per sidebar destination, grouped into the sidebar sections:
+// Overview, Library, Monitor, Workspace.
 
 enum Route: String, Hashable, Identifiable, CaseIterable, Codable {
     // Overview
@@ -144,7 +144,6 @@ enum Sidebar {
         SidebarSection(title: "Overview", routes: [.readout, .assistant]),
         SidebarSection(title: "Library", routes: [.skills, .agents, .rules, .commands, .tools, .plugins, .hooks, .memory, .instructions, .favorites, .collections]),
         SidebarSection(title: "Monitor", routes: [.usage, .live, .sessions, .costs, .ports]),
-        SidebarSection(title: "Workspace", routes: [.repos, .workGraph, .diffs, .snapshots]),
-        SidebarSection(title: "Health", routes: [.health]),
+        SidebarSection(title: "Workspace", routes: [.repos, .workGraph, .diffs, .snapshots, .health]),
     ]
 }

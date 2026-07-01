@@ -24,8 +24,8 @@ struct PortsView: View {
 
     var body: some View {
         content
-            .navigationTitle("Ports")
-            .navigationSubtitle(subtitleText)
+            .cortexScrollEdge()
+            .cortexPageChrome("Ports", subtitle: subtitleText, count: model.ports.ports.count)
             .searchable(text: $query, prompt: "Search ports")
             .searchFocused($searchFocused)
             .onChange(of: model.focusSearchToken) { _, _ in searchFocused = true }
@@ -44,12 +44,11 @@ struct PortsView: View {
     // MARK: Subtitle (count + last scan time)
 
     private var subtitleText: String {
-        let count = model.ports.ports.count
-        let portWord = count == 1 ? "port" : "ports"
+        // The count rides in the title badge now, so the subtitle carries only freshness.
         if let scan = model.ports.lastScan {
-            return "\(count) listening \(portWord) \u{00B7} scanned \(Fmt.relative(scan))"
+            return "Listening ports \u{00B7} scanned \(Fmt.relative(scan))"
         }
-        return "\(count) listening \(portWord)"
+        return "Listening ports"
     }
 
     // MARK: Body content (loading / empty / grouped native List)
@@ -94,6 +93,10 @@ struct PortsView: View {
                     }
                 }
             }
+            // Match the split-pane lists: clear the List's own backing so the band-to-content
+            // transition reads the same as every other page (no distinct grouped-list fill).
+            .scrollContentBackground(.hidden)
+            .background(Theme.canvas)
         }
     }
 

@@ -64,12 +64,23 @@ final class LibraryStore {
     @discardableResult
     func createCollection(name: String, icon: String = "rectangle.stack") -> Collection {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "Untitled" : trimmed
         let collection = Collection(id: UUID().uuidString,
-                                    name: trimmed.isEmpty ? "Untitled" : trimmed,
+                                    name: uniqueCollectionName(base),
                                     icon: icon, memberIDs: [])
         collections.append(collection)
         persist()
         return collection
+    }
+
+    /// Keep collection names unique: on a case-insensitive collision, append " (1)", " (2)",
+    /// … so creating two "New Collection"s yields "New Collection" + "New Collection (1)".
+    private func uniqueCollectionName(_ base: String) -> String {
+        let existing = Set(collections.map { $0.name.lowercased() })
+        guard existing.contains(base.lowercased()) else { return base }
+        var n = 1
+        while existing.contains("\(base) (\(n))".lowercased()) { n += 1 }
+        return "\(base) (\(n))"
     }
 
     func deleteCollection(_ id: String) {

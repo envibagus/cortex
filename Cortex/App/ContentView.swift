@@ -43,7 +43,11 @@ struct ContentView: View {
             ZStack {
                 DetailRouter(route: model.route)
                     .id(model.route)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .center)))
+                    // Scale from the TOP edge (not center): a center anchor makes a tall page's
+                    // top content start inset and slide up on entry - the "weird margin"
+                    // wobble, worst on Repos. Anchored to the top, the header stays put and the
+                    // page just grows downward. Kept subtle (0.97).
+                    .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .animation(.easeOut(duration: 0.32), value: model.route)
@@ -53,15 +57,18 @@ struct ContentView: View {
                 // region then eats clicks on the top-right action buttons (eye/pencil/star)
                 // and the bar bleeds whatever window sits behind Cortex. Keep content below
                 // the bar so every top control stays clickable.
-                // Keep the toolbar title EMPTY: the page name already shows as the list
-                // header, so a toolbar title just duplicates it (and the old "Cortex" text
-                // is unwanted). The "+" lives in the sidebar toolbar (see SidebarView).
+                // Default EMPTY title; each page sets its own via `.cortexPageChrome(...)`,
+                // which renders the page name (a touch larger) + count badge + subtitle in
+                // the band's `.title` slot. Inline display keeps it in the band (no iOS-style
+                // large title pushing into content). The "+" lives in the sidebar toolbar.
                 .navigationTitle("")
                 .toolbarTitleDisplayMode(.inline)
-                // Keep the unified title bar TRANSLUCENT (the blurred vibrancy) even on
-                // pages whose toolbar carries controls (e.g. Costs' window picker), which
-                // otherwise rendered an opaque band. SwiftUI-only - does not touch the
-                // NSWindow chrome, so the flush sidebar is unaffected.
+                // Keep the unified title bar TRANSLUCENT at all times. `.automatic` let the
+                // band frost on scroll, but it also rendered SOLID after a sidebar collapse on
+                // several pages (Favorites / Repos / Work Graph / Diffs / Snapshots) and stuck
+                // that way until a re-render (navigating elsewhere). `.hidden` keeps it
+                // consistently transparent (the app's long-standing look); the tradeoff is
+                // losing the on-scroll frost.
                 .toolbarBackground(.hidden, for: .windowToolbar)
                 // New-item creation modal: selecting "New Skill / Agent / Rule / Command"
                 // in the sidebar's NewItemMenu sets model.newItemKind, which presents this
@@ -207,9 +214,9 @@ struct SidebarView: View {
                 }
             }
 
-            // Settings in its OWN titled group (not lumped under "Health"): a normal
+            // Settings in its OWN titled group (not lumped under "Workspace"): a normal
             // titled Section reads as a distinct group, unlike a bare row (looks like
-            // part of Health) or a headerless Section (an oversized empty gap).
+            // part of the section above) or a headerless Section (an oversized empty gap).
             Section("App") {
                 SidebarRow(route: .settings, badge: nil)
             }
@@ -217,6 +224,10 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         // No sidebar title (the page name shows as each page's list header).
         .navigationTitle("")
+        // Keyboard focus is left to macOS: Tab / clicking a row moves focus between the
+        // sidebar and the list natively, and ↑/↓ navigate whichever pane holds focus.
+        // (A previous custom → / ← handoff force-held sidebar focus, which stopped a list
+        // click from taking the arrows AND caused a focus tug-of-war beachball.)
         // If the currently-routed page gets hidden (its Show toggle turned off), fall
         // back to Home so the detail pane never strands on a page with no sidebar row.
         .onChange(of: model.hiddenRoutes) { _, _ in
@@ -234,6 +245,11 @@ struct SidebarView: View {
 
     /// Right-aligned live count for countable destinations (nil hides the badge).
     private func badge(for route: Route) -> Text? {
+        // Hold every count badge until the first full local scan is in (model.isReady), so
+        // they reveal together instead of the fast library counts (Favorites / Collections)
+        // popping in ahead of the slower config / session counts. Repos / Diffs still fill
+        // in when the git scan lands (a beat later) since those numbers depend on it.
+        guard model.isReady else { return nil }
         // Live shows the number of OPEN Claude windows across your projects (running
         // `claude` processes), not just sessions that wrote recently - so two idle-but-
         // open windows still count. nil when none so the badge hides on a quiet workspace.

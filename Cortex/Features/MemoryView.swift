@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - MemoryView
 //
@@ -51,9 +52,16 @@ struct MemoryView: View {
         SplitDetailView(
             items: filteredMemories,
             selectedID: $selectedID,
+            title: ConfigKind.memory.plural,
+            subtitle: ConfigKind.memory.blurb,
+            count: filteredMemories.count,
             emptyIcon: ConfigKind.memory.icon,
             emptyTitle: "No memory selected",
-            emptyMessage: "Pick a memory file to read its contents."
+            emptyMessage: "Pick a memory file to read its contents.",
+            // ⌘C copies the memory file path.
+            actions: { item in
+                PageActions(copyPath: { model.copyPath(item.path) })
+            }
         ) {
             // List header: page title + live count + name/hook search + scope + sort filter
             MemoryListHeader(query: $query, count: filteredMemories.count,
@@ -99,27 +107,15 @@ private struct MemoryListHeader: View {
     @Binding var sort: LibrarySort
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Title row: smaller page title (the name also shows in the toolbar) + count.
-            HStack(spacing: 8) {
-                Text(ConfigKind.memory.plural)
-                    .font(.cortexTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 6)
-                Text("\(count)")
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            // Shared search + scope filter (All / Global / each project) + sort.
-            LibraryFilterBar(
-                query: $query,
-                placeholder: "Search by name or hook",
-                scope: $scope,
-                scopes: scopes,
-                sort: $sort
-            )
-        }
+        // Title + count + blurb now live in the toolbar band (`.cortexPageChrome`); the
+        // left pane keeps just the shared search / scope / sort filter.
+        LibraryFilterBar(
+            query: $query,
+            placeholder: "Search by name or hook",
+            scope: $scope,
+            scopes: scopes,
+            sort: $sort
+        )
     }
 }
 
@@ -198,7 +194,7 @@ private struct MemoryDetail: View {
                 content: bodyText,
                 showSource: showSource,
                 metadata: metadata,
-                topTrailing: AnyView(MemoryActionBar(id: item.id, showSource: $showSource))
+                topTrailing: AnyView(MemoryActionBar(id: item.id, path: item.path, showSource: $showSource))
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -246,8 +242,11 @@ private struct MemoryDetail: View {
 // library browsers' floating toolbars exactly.
 
 private struct MemoryActionBar: View {
+    @Environment(AppModel.self) private var model
     let id: String
+    let path: String
     @Binding var showSource: Bool
+    @State private var confirmingDelete = false
 
     var body: some View {
         LiquidGlassGroup(spacing: 8) {
@@ -255,12 +254,65 @@ private struct MemoryActionBar: View {
                 // Left pill: markdown preview / source toggle (eye + code)
                 DocumentSourceToggle(showSource: $showSource)
 
-                // Right pill: favorite toggle (favorited memory files appear on Favorites)
-                FavoriteToggle(id: id)
-                    .padding(4)
-                    .glassPill()
+                // Right pill: favorite star + an ellipsis menu (Show in Finder / Delete),
+                // matching the Skills / Agents detail toolbars.
+                HStack(spacing: 2) {
+                    FavoriteToggle(id: id)
+
+                    Menu {
+                        Button {
+                            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+                        } label: {
+                            Label("Show in Finder", systemImage: "folder")
+                        }
+                        Divider()
+                        Button(role: .destructive) { confirmingDelete = true } label: {
+                            Label("Delete\u{2026}", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 30, height: 26)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                }
+                .padding(4)
+                .glassPill()
             }
         }
+        // Native confirmation before moving the memory file to the Trash (reversible).
+        .alert("Move this memory to the Trash?", isPresented: $confirmingDelete) {
+            Button("Move to Trash", role: .destructive) { performDelete() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The memory file moves to the Trash. Undo from the toast, or restore it from the Trash.")
+        }
+    }
+
+    private func performDelete() {
+        let name = (path as NSString).lastPathComponent
+        guard let result = try? MemoryFileOps.trash(path) else {
+            model.showToast("Couldn't move \u{201C}\(name)\u{201D} to the Trash")
+            return
+        }
+        // Rescan so the trashed file drops out of the list immediately.
+        Task { await model.config.load(roots: model.scanRoots) }
+        model.showToast(
+            "Moved \u{201C}\(name)\u{201D} to the Trash",
+            action: AppModel.ToastAction(label: "Undo") {
+                do {
+                    try MemoryFileOps.restore(from: result.trashed, to: result.original)
+                    Task { await model.config.load(roots: model.scanRoots) }
+                } catch {
+                    // The Trash item may be gone, or a new file now occupies the original path.
+                    model.showToast("Couldn't restore \u{201C}\(name)\u{201D} - check the Trash")
+                }
+            }
+        )
     }
 }
 

@@ -34,6 +34,11 @@ final class AppModel {
     // ReposView consumes + clears it.
     var repoSelectionHint: String?
 
+    // An item id (skill/agent path, or MCP server name) to auto-select when its library page
+    // opens - set by the ⌘K palette so clicking a result deep-links to that exact item, not
+    // just the page. The destination page (ConfigBrowser / ToolsView) consumes + clears it.
+    var librarySelectionHint: String?
+
     // Route history for ⌘[ (back) / ⌘] (forward).
     private var routeHistory: [Route] = [.readout]
     private var historyIndex = 0
@@ -53,9 +58,27 @@ final class AppModel {
     private(set) var focusSearchToken = 0
     func focusSearch() { focusSearchToken += 1 }
 
-    // ⌘\: bump this token; ContentView observes it and flips the sidebar's visibility.
+    // ⌘B / ⌘\: bump this token; ContentView observes it and flips the sidebar's visibility.
     private(set) var sidebarToggleToken = 0
     func toggleSidebar() { sidebarToggleToken += 1 }
+
+    // ⌘R: bumped by refreshAll so the current split page replays its skeleton while the
+    // data reloads (a visible "checking for new data" cue). refreshIfStale does NOT bump
+    // it, so ordinary tab-hopping never flashes a skeleton.
+    private(set) var refreshToken = 0
+
+    // The item id a keyboard ⌫ (Delete) asked to remove. The mounted detail pane watches
+    // this and raises its OWN native confirmation when it matches, then clears it, so the
+    // list-focused Delete reuses the existing confirm + Undo flow.
+    var pendingDeleteItemID: String?
+
+    /// Copy a path / endpoint to the clipboard and confirm with a toast (⌘C on a list row).
+    func copyPath(_ path: String) {
+        guard !path.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
+        showToast("Path copied")
+    }
 
     /// The visible sidebar routes, top to bottom (pinned first, then each section's
     /// routes), excluding hidden routes and Settings. ⌘1-9 bind to the first nine, so the
@@ -361,18 +384,59 @@ final class AppModel {
     /// through `setLiveActivity(_:)` so the hook install/uninstall + error surfacing run.
     private(set) var menuBarLiveActivityEnabled: Bool = (UserDefaults.standard.object(forKey: "menuBarLiveActivity") as? Bool) ?? false
 
-    /// Play a soft chime when a turn longer than a minute finishes. Default off.
+    /// Play a soft chime when a turn longer than ~10 seconds finishes (trivial instant turns
+    /// stay silent). Default off.
     var menuBarCompletionSound: Bool = (UserDefaults.standard.object(forKey: "menuBarCompletionSound") as? Bool) ?? false {
         didSet {
             UserDefaults.standard.set(menuBarCompletionSound, forKey: "menuBarCompletionSound")
             activity.completionSoundEnabled = menuBarCompletionSound
+            // The chime is driven by the same turn-detection hooks/poll as live activity, so
+            // it works INDEPENDENTLY: turning it on installs the hooks (if live activity isn't
+            // already running them); turning it off tears them down only when live activity
+            // isn't using them too.
+            if menuBarCompletionSound {
+                activity.completionSoundName = menuBarCompletionSoundName
+                if !activity.isInstalled, let error = activity.enable() {
+                    showToast(error, duration: 5)
+                    // Install failed: roll the preference back off so we never persist an
+                    // enabled-but-not-installed state (it would stay silently broken across
+                    // launches). Assigning here does not re-enter didSet, so undo its side
+                    // effects explicitly.
+                    menuBarCompletionSound = false
+                    UserDefaults.standard.set(false, forKey: "menuBarCompletionSound")
+                    activity.completionSoundEnabled = false
+                }
+            } else if !menuBarLiveActivityEnabled, activity.isInstalled {
+                activity.disable()
+            }
         }
+    }
+
+    /// The chosen completion sound: a bundled "hero-complete-<pack>.caf". Default "soft".
+    /// Same observed-stored-rawValue + didSet pattern as the other prefs; the name is
+    /// mirrored into ActivityService so changing it takes effect on the next completion.
+    private var menuBarCompletionSoundNameRaw: String = UserDefaults.standard.string(forKey: "menuBarCompletionSoundName") ?? "hero-complete-soft" {
+        didSet {
+            UserDefaults.standard.set(menuBarCompletionSoundNameRaw, forKey: "menuBarCompletionSoundName")
+            activity.completionSoundName = menuBarCompletionSoundNameRaw
+        }
+    }
+    var menuBarCompletionSoundName: String {
+        get { menuBarCompletionSoundNameRaw }
+        set { menuBarCompletionSoundNameRaw = newValue }
     }
 
     /// Show the spend breakdown (today / last 7 / last 30 days cost + tokens) in the menu
     /// bar dropdown panel. Default on; turn off to keep dollar amounts off the menu bar.
     var menuBarShowSpend: Bool = (UserDefaults.standard.object(forKey: "menuBarShowSpend") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(menuBarShowSpend, forKey: "menuBarShowSpend") }
+    }
+
+    /// Fire the one-shot confetti burst when a turn finishes. Display-only sub-option of live
+    /// activity (the burst only shows while live activity is on), so no hooks to install here.
+    /// Default on.
+    var menuBarConfetti: Bool = (UserDefaults.standard.object(forKey: "menuBarConfetti") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(menuBarConfetti, forKey: "menuBarConfetti") }
     }
 
     // Global hotkey to toggle the panel, stored as a Carbon virtual keycode + modifier
@@ -416,7 +480,9 @@ final class AppModel {
     func setLiveActivity(_ on: Bool) {
         if on {
             activity.completionSoundEnabled = menuBarCompletionSound
-            if let error = activity.enable() {
+            activity.completionSoundName = menuBarCompletionSoundName
+            // Install the hooks + poll unless the completion sound already has them running.
+            if !activity.isInstalled, let error = activity.enable() {
                 menuBarLiveActivityEnabled = false
                 UserDefaults.standard.set(false, forKey: "menuBarLiveActivity")
                 showToast(error, duration: 5)
@@ -426,26 +492,28 @@ final class AppModel {
             workflows.start()
             showToast("Live activity on")
         } else {
-            activity.disable()
             workflows.stop()
             menuBarLiveActivityEnabled = false
+            // Keep the turn-detection monitoring alive if the completion sound still needs it.
+            if !menuBarCompletionSound { activity.disable() }
             showToast("Live activity off")
         }
         UserDefaults.standard.set(menuBarLiveActivityEnabled, forKey: "menuBarLiveActivity")
     }
 
     /// Bring the main window to the front (from a menu-bar action), optionally switching
-    /// to a route first. The dock icon stays visible, so the window is normally available.
+    /// to a route first. The main scene is a single `Window`, so `openMainWindow`
+    /// (openWindow(id: "main")) orders the existing window forward, or recreates it if it
+    /// was closed to the menu bar - its .task then re-runs bootstrap and reloads the data
+    /// freed on close. No manual NSApp.windows lookup is needed: the singleton scene
+    /// handles both cases and can't produce a duplicate. `activate` first so the click
+    /// steals focus from whatever app was frontmost (ignoringOtherApps is soft-deprecated
+    /// on macOS 14+, but it's the reliable way to force-front a .regular app from a status
+    /// item; plain `activate()` often fails to bring the window forward).
     func revealMainWindow(route: Route? = nil) {
         if let route { self.route = route }
         NSApp.activate(ignoringOtherApps: true)
-        if let main = NSApp.windows.first(where: { $0.styleMask.contains(.titled) && $0.canBecomeMain }) {
-            main.makeKeyAndOrderFront(nil)
-        } else {
-            // No window (closed to the menu bar): reopen one via SwiftUI; its .task then
-            // re-runs bootstrap and reloads the data that was freed on close.
-            openMainWindow?()
-        }
+        openMainWindow?()
     }
 
     /// Check GitHub for a newer release. A manual check (menu / Settings) always reports
@@ -489,8 +557,14 @@ final class AppModel {
         }
         // Live activity + the workflow scan are one opt-in: both run only when enabled, so a
         // user who left it off pays no background hook polling or projects-tree scanning.
-        if menuBarLiveActivityEnabled {
+        // Resume the turn-detection poll if EITHER live activity or the completion sound is
+        // on (both rely on the same installed hooks). The workflow scan is live-activity only.
+        if menuBarLiveActivityEnabled || menuBarCompletionSound {
+            activity.completionSoundEnabled = menuBarCompletionSound
+            activity.completionSoundName = menuBarCompletionSoundName
             activity.resumeIfInstalled()
+        }
+        if menuBarLiveActivityEnabled {
             workflows.start()
         }
         startBackgroundLoops()
@@ -514,9 +588,18 @@ final class AppModel {
         }
         claudeLoop = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                self?.refreshRunningClaude()
-                let secs = Double((self?.route == .live) ? 8 : 30)
-                try? await Task.sleep(for: .seconds(secs))
+                guard let self else { break }
+                // The running-`claude` scan feeds ONLY the Live page + its sidebar badge, so
+                // skip the periodic `ps` scan while Live is hidden (nothing else reads it).
+                // The loop stays alive on a slow idle tick and resumes scanning the moment
+                // Live is shown again. This only pauses Cortex's own poll; no OS process is
+                // signalled or slept.
+                if self.isHidden(.live) {
+                    try? await Task.sleep(for: .seconds(30))
+                    continue
+                }
+                self.refreshRunningClaude()
+                try? await Task.sleep(for: .seconds(self.route == .live ? 8 : 30))
             }
         }
     }
@@ -696,6 +779,9 @@ final class AppModel {
 
     /// Refresh everything (toolbar refresh / ⌘R).
     func refreshAll() async {
+        // Replay the current split page's skeleton while the reload runs, so a manual
+        // refresh visibly reloads (and any new data lands behind the shimmer).
+        refreshToken += 1
         async let s: Void = sessions.load()
         async let p: Void = ports.load()
         async let c: Void = config.load(roots: scanRoots)
@@ -991,9 +1077,14 @@ final class AppModel {
         }
         let projectBlock = projectLines.isEmpty ? "  (none detected)" : projectLines.joined(separator: "\n")
 
+        // Last-30-days spend so the assistant can answer "how much this month" from a real
+        // figure instead of only the all-time total.
+        let last30Cost = sessions.stats(window: .days30).totalCost
+
         chat.stackContext = """
         - User: \(userName) (@\(userLogin))
-        - Sessions: \(stats.sessions), messages: \(stats.messages), tokens: \(Fmt.compact(stats.totalTokens)), all-time cost: \(Fmt.money(stats.totalCost))
+        - Sessions: \(stats.sessions), messages: \(stats.messages), tokens: \(Fmt.compact(stats.totalTokens))
+        - Cost: \(Fmt.money(stats.totalCost)) all-time, \(Fmt.money(last30Cost)) in the last 30 days
         - Favorite model: \(stats.favoriteModel ?? "n/a"); current streak: \(stats.currentStreak)d
         - Local repos: \(repos.repos.count) (\(repos.reposWithSkills) with skills, \(repos.reposWithAgents) with agents)
         - Skills: \(skills), Agents: \(agents), Hooks: \(config.hooks.count), Memory files: \(config.memories.count) (across all scopes)

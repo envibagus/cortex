@@ -16,39 +16,46 @@ import AppKit
 struct CollectionsView: View {
     @Environment(AppModel.self) private var model
 
-    // The selected collection in the left list (nil == none).
-    @State private var selectedCollectionID: LibraryStore.Collection.ID?
+    // What's selected in the tree: a collection (-> its metadata in the right pane) or a
+    // member item (-> that item's document). One selection drives the whole right pane.
+    enum Selection: Hashable {
+        case collection(String)
+        case member(item: String, collection: String)
+    }
+    @State private var selection: Selection?
+    // Collection ids whose tree is expanded (members shown nested beneath them).
+    @State private var expanded: Set<String> = []
 
     // New-collection alert state (native .alert with a TextField).
     @State private var showNewCollection = false
     @State private var newCollectionName = ""
 
     var body: some View {
-        SplitDetailView(
-            items: model.library.collections,
-            selectedID: $selectedCollectionID,
-            emptyIcon: "rectangle.stack",
-            emptyTitle: "No collection selected",
-            emptyMessage: "Select a collection on the left to browse its items."
-        ) {
-            // Left-pane header: title + live count + a native "+" add button.
-            CollectionsListHeader(
-                count: model.library.collections.count,
-                onAdd: beginNewCollection
-            )
-        } row: { collection, _ in
-            // Plain row content; the native List(selection:) draws the highlight.
-            CollectionsListRow(collection: collection)
-        } detail: { collection in
-            // Right pane: the selected collection's members, browsable.
-            CollectionDetailPane(collection: collection)
+        Group {
+            if model.library.collections.isEmpty {
+                CollectionsEmptyPane(onCreate: beginNewCollection)
+            } else {
+                HStack(spacing: 0) {
+                    tree
+                        .frame(width: 340)
+                        .background(Theme.canvas)
+                    Divider().overlay(Theme.stroke)
+                    detail
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Theme.canvas)
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.canvas)
-        // Full-pane empty state when there are no collections at all.
-        .overlay {
-            if model.library.collections.isEmpty {
-                CollectionsEmptyPane(onCreate: beginNewCollection)
+        .cortexPageChrome("Collections",
+                          subtitle: "Group skills, agents, commands, and rules",
+                          count: model.library.collections.count) {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: beginNewCollection) {
+                    Label("New Collection", systemImage: "plus")
+                }
+                .help("New collection")
             }
         }
         // Native new-collection alert: a single TextField + Create / Cancel.
@@ -59,11 +66,141 @@ struct CollectionsView: View {
         } message: {
             Text("Group skills, agents, commands, and rules together.")
         }
-        // A "New Collection..." item nested in a member's Collections menu posts this
-        // to open the same native create alert from here.
+        // A "New Collection..." item nested in a member's Collections menu posts this.
         .onReceive(NotificationCenter.default.publisher(for: .cortexNewCollectionRequested)) { _ in
             beginNewCollection()
         }
+        .onAppear(perform: autoSelectFirst)
+    }
+
+    // MARK: Tree (left pane) - collections, each expandable to its members
+
+    private var tree: some View {
+        // A native `.plain` List (the SAME proven pattern as SplitDetailView's left pane): a
+        // plain list respects the top safe area, so rows always sit BELOW the toolbar band
+        // (unlike a `.sidebar` list, which extends up under the title and scrolls rows over
+        // it), and because selection is driven by each row's own Button action - NOT
+        // `List(selection:)` - the list never auto-scrolls a selected row up over the band.
+        // Custom rows draw the inset-rounded selection; `.cortexScrollEdge` frosts the band as
+        // rows scroll under it. Members render as extra rows beneath an expanded collection.
+        List {
+            ForEach(model.library.collections) { collection in
+                CollectionTreeRow(
+                    collection: collection,
+                    memberCount: model.library.memberCount(collection.id),
+                    isSelected: selection == .collection(collection.id),
+                    isExpanded: expanded.contains(collection.id),
+                    // Clicking a collection selects it AND opens it (if closed); it never
+                    // collapses on click - the caret is the only way to collapse.
+                    onSelect: {
+                        selection = .collection(collection.id)
+                        expanded.insert(collection.id)
+                    },
+                    onToggle: { toggleExpanded(collection.id) }
+                )
+                .listRowInsets(EdgeInsets(top: 1, leading: Theme.splitListRowInset,
+                                          bottom: 1, trailing: Theme.splitListRowInset))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+
+                // Members nested beneath an expanded collection.
+                if expanded.contains(collection.id) {
+                    ForEach(members(of: collection)) { item in
+                        CollectionMemberTreeRow(
+                            item: item,
+                            collectionID: collection.id,
+                            isSelected: selection == .member(item: item.id, collection: collection.id),
+                            onTap: { selection = .member(item: item.id, collection: collection.id) }
+                        )
+                        .listRowInsets(EdgeInsets(top: 1, leading: Theme.splitListRowInset,
+                                                  bottom: 1, trailing: Theme.splitListRowInset))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                    }
+                }
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .cortexScrollEdge()
+    }
+
+    // MARK: Detail (right pane) - collection metadata, or a member's document
+
+    @ViewBuilder private var detail: some View {
+        switch selection {
+        case let .member(itemID, cid):
+            // Resolve from library items OR mapped MCP servers (a member can be either), so
+            // clicking an MCP server / plugin in a collection opens its detail instead of a
+            // blank pane.
+            if let item = resolveMember(itemID) {
+                CollectionMemberDetail(item: item, collectionID: cid)
+            } else {
+                detailEmpty
+            }
+        case let .collection(cid):
+            if let collection = model.library.collections.first(where: { $0.id == cid }) {
+                CollectionMetadataPane(collection: collection)
+            } else {
+                detailEmpty
+            }
+        case nil:
+            detailEmpty
+        }
+    }
+
+    private var detailEmpty: some View {
+        CortexEmptyState(icon: "rectangle.stack",
+                         title: "No collection selected",
+                         message: "Select a collection on the left to see what's inside.")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: Helpers
+
+    /// Resolve a collection's members in stored order (live). Members can be library items
+    /// (skills/agents/rules/commands/plugins/instructions - already ConfigItems) OR MCP
+    /// servers (mapped to a ConfigItem for display), so one collection can mix anything the
+    /// user wants to keep or share together.
+    private func members(of collection: LibraryStore.Collection) -> [ConfigItem] {
+        let itemsByID = Dictionary(model.config.items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let mcpByID = Dictionary(model.config.mcpServers.map { ($0.id, Self.mcpConfigItem($0)) }, uniquingKeysWith: { a, _ in a })
+        return collection.memberIDs.compactMap { itemsByID[$0] ?? mcpByID[$0] }
+    }
+
+    /// Map an MCP server to a ConfigItem so it can be shown as a collection member (mirrors
+    /// how the Favorites page surfaces MCP servers).
+    static func mcpConfigItem(_ server: MCPServer) -> ConfigItem {
+        ConfigItem(
+            id: server.id, name: server.name,
+            detail: "MCP \u{00B7} \(server.transport.uppercased()) \u{00B7} \(server.scope)",
+            path: server.command ?? server.url ?? "",
+            kind: .mcp, source: .claude, isGlobal: server.scope == "user",
+            projectName: server.scope == "user" ? nil : server.scope,
+            fileSize: 0, modified: Date(),
+            content: "**Transport:** \(server.transport)\n\n**Scope:** \(server.scope)\n\n`\(server.command ?? server.url ?? "unknown")`",
+            frontmatter: [:]
+        )
+    }
+
+    /// Resolve a single member id to a ConfigItem from library items OR mapped MCP servers (a
+    /// member can be either), so the detail pane can open MCP servers and plugins too.
+    private func resolveMember(_ id: String) -> ConfigItem? {
+        if let item = model.config.items.first(where: { $0.id == id }) { return item }
+        if let server = model.config.mcpServers.first(where: { $0.id == id }) { return Self.mcpConfigItem(server) }
+        return nil
+    }
+
+    /// Toggle a collection's expanded state (its members show/hide beneath it).
+    private func toggleExpanded(_ id: String) {
+        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+    }
+
+    private func autoSelectFirst() {
+        // Every collection auto-shows its members: expand them all on open.
+        expanded = Set(model.library.collections.map(\.id))
+        guard selection == nil, let first = model.library.collections.first else { return }
+        selection = .collection(first.id)
     }
 
     // MARK: New-collection actions
@@ -78,87 +215,78 @@ struct CollectionsView: View {
         guard !name.isEmpty else { newCollectionName = ""; return }
         let created = model.library.createCollection(name: name)
         newCollectionName = ""
-        // Jump to the freshly created collection.
-        selectedCollectionID = created.id
+        selection = .collection(created.id)
     }
 }
 
-// MARK: - CollectionsListHeader
+// MARK: - CollectionTreeRow
 //
-// The left pane's sticky header: a stack glyph + "Collections" title + a live count
-// pill, and a trailing native "+" button that opens the new-collection alert.
+// A collection node in the left tree: a caret (a SEPARATE hit target that only toggles the
+// members open/closed), the collection glyph, its name, and a member-count badge. Clicking
+// the icon/name SELECTS the collection (right pane shows its metadata) without collapsing the
+// tree. Right-click renames or deletes. The rounded selection is inset on both sides to match
+// SplitDetailView's SplitRow.
 
-private struct CollectionsListHeader: View {
-    let count: Int
-    let onAdd: () -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            // Standard big title, no leading glyph.
-            Text("Collections")
-                .font(.cortexTitle)
-                .foregroundStyle(.primary)
-            Text("\(count)")
-                .font(.callout.weight(.medium).monospacedDigit())
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 6)
-
-            // Native add button -> new-collection alert
-            Button(action: onAdd) {
-                Image(systemName: "plus")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.textPrimary)
-                    .frame(width: 24, height: 24)
-                    .background(Theme.hairFill, in: RoundedRectangle(cornerRadius: Theme.radiusSmall))
-            }
-            .buttonStyle(.plain)
-            .linkCursor()
-            .help("New collection")
-        }
-    }
-}
-
-// MARK: - CollectionsListRow
-//
-// One PLAIN row in the native left list: the collection's icon, its name, and a
-// trailing member-count badge. A .contextMenu offers Rename (native alert + TextField)
-// and Delete. The enclosing List(selection:) supplies the selection highlight.
-
-private struct CollectionsListRow: View {
+private struct CollectionTreeRow: View {
     @Environment(AppModel.self) private var model
     let collection: LibraryStore.Collection
+    let memberCount: Int
+    let isSelected: Bool
+    let isExpanded: Bool
+    let onSelect: () -> Void
+    let onToggle: () -> Void
 
-    // Rename alert state, scoped to this row.
+    @State private var hovering = false
     @State private var showRename = false
     @State private var renameText = ""
 
     var body: some View {
-        HStack(spacing: 10) {
-            // Leading collection glyph
-            Image(systemName: collection.icon)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
+        HStack(spacing: 8) {
+            // Caret ONLY toggles expand/collapse (a separate hit target from the name). An
+            // empty collection has nothing to expand, so its caret is dimmed and disabled
+            // (kept in place so names stay aligned with populated rows).
+            Button(action: onToggle) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(isSelected ? .white : Theme.textTertiary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .opacity(memberCount == 0 ? 0.2 : 1)
+                    .frame(width: 16, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(memberCount == 0)
+            .help(isExpanded ? "Collapse" : "Expand")
 
-            Text(collection.name)
-                .font(.body)
-                .foregroundStyle(Theme.textPrimary)
-                .lineLimit(1)
-
-            Spacer(minLength: 8)
-
-            // Trailing member-count badge
-            Pill(text: "\(model.library.memberCount(collection.id))",
-                 tint: Theme.textSecondary, filled: false)
+            // Clicking the icon/name selects the collection (shows its metadata on the right).
+            Button(action: onSelect) {
+                HStack(spacing: 8) {
+                    Image(systemName: collection.icon)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(isSelected ? .white : Theme.textSecondary)
+                        .frame(width: 18)
+                    Text(collection.name)
+                        .font(.body)
+                        .foregroundStyle(isSelected ? .white : Theme.textPrimary)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("\(memberCount)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(isSelected ? .white.opacity(0.85) : Theme.textSecondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
+            .fill(isSelected ? Color(nsColor: .selectedContentBackgroundColor)
+                             : (hovering ? Theme.hairFill : .clear)))
         .contentShape(Rectangle())
-        // Right-click: rename / delete
+        .onHover { hovering = $0 }
         .contextMenu {
-            Button {
-                renameText = collection.name
-                showRename = true
-            } label: {
+            Button { renameText = collection.name; showRename = true } label: {
                 Label("Rename", systemImage: "pencil")
             }
             Divider()
@@ -168,7 +296,6 @@ private struct CollectionsListRow: View {
                 Label("Delete", systemImage: "trash")
             }
         }
-        // Native rename alert
         .alert("Rename Collection", isPresented: $showRename) {
             TextField("Collection name", text: $renameText)
             Button("Rename") {
@@ -181,354 +308,200 @@ private struct CollectionsListRow: View {
     }
 }
 
-// MARK: - CollectionDetailPane
+// MARK: - CollectionMemberTreeRow
 //
-// The right pane for a selected collection: a nested master/detail. The top is a
-// header (collection icon + name + member count). Below it, the resolved member items
-// are shown in a native List on the left and the selected member's document detail on
-// the right. When the collection has no members yet, a friendly empty state is shown
-// with guidance to add items via their context menu.
+// A member item nested (indented) under its collection: a kind glyph, the item name, and a
+// favorite marker. Clicking selects it (right pane shows the item's document). Right-click
+// exposes the shared library actions (favorite, collections, remove, reveal).
 
-private struct CollectionDetailPane: View {
-    @Environment(AppModel.self) private var model
-    let collection: LibraryStore.Collection
-
-    // The selected member item inside this collection (nil == none).
-    @State private var selectedMemberID: ConfigItem.ID?
-
-    // Resolve member ConfigItems from the global item set, preserving the collection's
-    // stored order. Re-read live so membership changes update immediately.
-    private var members: [ConfigItem] {
-        let all = Dictionary(uniqueKeysWithValues: model.config.items.map { ($0.id, $0) })
-        return collection.memberIDs.compactMap { all[$0] }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Collection header
-            CollectionDetailHeader(collection: collection, memberCount: members.count)
-
-            Divider().overlay(Theme.stroke)
-
-            if members.isEmpty {
-                // Empty-collection state
-                CortexEmptyState(
-                    icon: "tray",
-                    title: "No items yet",
-                    message: "Add skills, agents, commands, or rules to \"\(collection.name)\" from their context menu (right-click an item, then Collections)."
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                // Nested member master/detail
-                HStack(spacing: 0) {
-                    // Member list
-                    List(selection: $selectedMemberID) {
-                        ForEach(members) { item in
-                            CollectionMemberRow(item: item, collectionID: collection.id)
-                                .tag(item.id)
-                        }
-                    }
-                    .listStyle(.inset)
-                    .scrollContentBackground(.hidden)
-                    .frame(width: 300)
-                    .background(Theme.canvas)
-
-                    Divider().overlay(Theme.stroke)
-
-                    // Member detail (markdown + preview/source toggle + metadata bar)
-                    Group {
-                        if let item = members.first(where: { $0.id == selectedMemberID }) {
-                            CollectionMemberDetail(item: item, collectionID: collection.id)
-                        } else {
-                            CortexEmptyState(
-                                icon: "doc.text",
-                                title: "No item selected",
-                                message: "Select an item to preview its content."
-                            )
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Theme.canvas)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.canvas)
-        // Reset member selection when the collection changes; auto-select first member.
-        .id(collection.id)
-        .onAppear { selectFirstMemberIfNeeded() }
-        .onChange(of: collection.memberIDs) { _, _ in
-            if let id = selectedMemberID, !members.contains(where: { $0.id == id }) {
-                selectedMemberID = members.first?.id
-            } else {
-                selectFirstMemberIfNeeded()
-            }
-        }
-    }
-
-    private func selectFirstMemberIfNeeded() {
-        guard selectedMemberID == nil, let first = members.first?.id else { return }
-        selectedMemberID = first
-    }
-}
-
-// MARK: - CollectionDetailHeader
-//
-// The collection's identity strip above its member list: a tinted glyph badge, the
-// collection name, and a member-count subtitle.
-
-private struct CollectionDetailHeader: View {
-    let collection: LibraryStore.Collection
-    let memberCount: Int
-
-    var body: some View {
-        HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                .fill(Theme.hairFill)
-                .frame(width: 40, height: 40)
-                .overlay(
-                    Image(systemName: collection.icon)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                )
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(collection.name)
-                    .font(.cortexHeadline)
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
-                Text(memberCount == 1 ? "1 item" : "\(memberCount) items")
-                    .font(.cortexCaption)
-                    .foregroundStyle(Theme.textSecondary)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-// MARK: - CollectionMemberRow
-//
-// One PLAIN row for a collection member: a leading kind glyph, name over a one-line
-// detail, a small favorite star.fill (when starred), and a trailing source-tool glyph.
-// A .contextMenu offers the shared item actions (favorite, collection membership,
-// remove from this collection, show in Finder).
-
-private struct CollectionMemberRow: View {
+private struct CollectionMemberTreeRow: View {
     @Environment(AppModel.self) private var model
     let item: ConfigItem
     let collectionID: String
+    let isSelected: Bool
+    let onTap: () -> Void
+    @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            // Leading kind glyph
-            Image(systemName: item.kind.icon)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(Theme.textSecondary)
-                .frame(width: 18)
-
-            // Name over single-line detail
-            VStack(alignment: .leading, spacing: 2) {
+        Button(action: onTap) {
+            HStack(spacing: 8) {
+                Image(systemName: item.kind.icon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(isSelected ? .white : Theme.textSecondary)
+                    .frame(width: 16)
                 Text(item.name)
-                    .font(.body)
-                    .foregroundStyle(Theme.textPrimary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(isSelected ? .white : Theme.textPrimary)
                     .lineLimit(1)
-                Text(item.detail)
-                    .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
-                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if model.library.isFavorite(item.id) {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(isSelected ? .white.opacity(0.85) : Theme.textTertiary)
+                }
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
+                .fill(isSelected ? Color(nsColor: .selectedContentBackgroundColor)
+                                 : (hovering ? Theme.hairFill : .clear)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Indent members further so they nest clearly beneath their collection's name.
+        .padding(.leading, 40)
+        .onHover { hovering = $0 }
+        .contextMenu { ItemLibraryMenu(item: item, currentCollectionID: collectionID) }
+    }
+}
 
-            Spacer(minLength: 8)
+// MARK: - CollectionMetadataPane
+//
+// The right pane when a COLLECTION (not a member) is selected: the collection's identity
+// (glyph + name + total) over a "Contents" breakdown of how many of each kind it holds
+// (Skills / Agents / …), showing ONLY the kinds actually present. An empty collection
+// shows a friendly empty state instead. Selecting a member in the tree swaps this pane for
+// that item's document.
 
-            // Favorited marker
-            if model.library.isFavorite(item.id) {
-                Image(systemName: "star")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+private struct CollectionMetadataPane: View {
+    @Environment(AppModel.self) private var model
+    let collection: LibraryStore.Collection
+
+    private var members: [ConfigItem] {
+        // Resolve from library items AND mapped MCP servers, so the "N items" count and the
+        // per-kind breakdown match the tree's member count (which also includes MCP servers).
+        let itemsByID = Dictionary(model.config.items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let mcpByID = Dictionary(model.config.mcpServers.map { ($0.id, CollectionsView.mcpConfigItem($0)) }, uniquingKeysWith: { a, _ in a })
+        return collection.memberIDs.compactMap { itemsByID[$0] ?? mcpByID[$0] }
+    }
+
+    /// Non-zero counts per kind, in ConfigKind's canonical order (nothing shown for kinds
+    /// the collection doesn't contain).
+    private var breakdown: [(kind: ConfigKind, count: Int)] {
+        let byKind = Dictionary(grouping: members, by: \.kind).mapValues(\.count)
+        return ConfigKind.allCases.compactMap { kind in
+            let n = byKind[kind] ?? 0
+            return n > 0 ? (kind, n) : nil
+        }
+    }
+
+    var body: some View {
+        let members = members
+        // Empty AND populated collections share the SAME wrapper (a top-aligned ScrollView with
+        // the identity header + a "Contents" GroupBox), so selecting one never changes the
+        // pane's layout shape. Only the card's body differs: a per-kind breakdown when
+        // populated, or an inline empty note when the collection has no members. (An earlier
+        // full-height CENTERED empty state here is what made the whole window jump/scroll.)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                // Identity
+                HStack(spacing: 14) {
+                    RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+                        .fill(Theme.hairFill)
+                        .frame(width: 44, height: 44)
+                        .overlay(Image(systemName: collection.icon)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.secondary))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(collection.name)
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(2)
+                        Text(members.count == 1 ? "1 item" : "\(members.count) items")
+                            .font(.callout)
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                // Contents card: per-kind breakdown when populated, or an inline empty note.
+                GroupBox {
+                    if members.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "tray")
+                                .font(.system(size: 26, weight: .regular))
+                                .foregroundStyle(Theme.textTertiary)
+                            Text("No items yet")
+                                .font(.headline)
+                                .foregroundStyle(Theme.textPrimary)
+                            Text("Right-click any skill, agent, command, or rule and choose Collections to add it here.")
+                                .font(.callout)
+                                .foregroundStyle(Theme.textSecondary)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 28)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(Array(breakdown.enumerated()), id: \.element.kind) { idx, entry in
+                                HStack(spacing: 10) {
+                                    Image(systemName: entry.kind.icon)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(Theme.textSecondary)
+                                        .frame(width: 20)
+                                    Text(entry.kind.plural)
+                                        .font(.body)
+                                        .foregroundStyle(Theme.textPrimary)
+                                    Spacer(minLength: 8)
+                                    Text("\(entry.count)")
+                                        .font(.body.monospacedDigit())
+                                        .foregroundStyle(Theme.textSecondary)
+                                }
+                                .padding(.vertical, 9)
+                                if idx < breakdown.count - 1 { Divider() }
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Contents", systemImage: "square.stack.3d.up")
+                        .font(.headline)
+                }
             }
-
-            // Trailing source-tool glyph
-            Image(systemName: item.source.iconName)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-                .opacity(0.7)
+            .padding(Theme.pageHInset)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.vertical, 6)
-        .contentShape(Rectangle())
-        .contextMenu {
-            ItemLibraryMenu(item: item, currentCollectionID: collectionID)
-        }
+        .id(collection.id)
     }
 }
 
 // MARK: - CollectionMemberDetail
 //
-// The document viewer for a selected member, mirroring the native detail: a
-// compact toolbar (favorite/unfavorite star, a preview/source segmented toggle, and a
-// Menu duplicating the item context actions) over a scrolling body that shows either
-// the rendered MarkdownText (preview) or the raw monospaced source (source), with a
-// pinned DetailMetadataBar at the bottom.
+// The viewer for a selected member. To stay consistent with the rest of the app it uses NO
+// bespoke viewer: it dispatches on the item's kind and shows the SAME default detail view the
+// item's own home page uses - Plugins -> PluginDetail, MCP -> MCPServerDetail, Instructions ->
+// InstructionDetail, and skills / agents / commands / rules (and other markdown kinds) ->
+// ConfigItemDetail. "New Collection…" from any of those viewers' menus opens this page's modal.
 
 private struct CollectionMemberDetail: View {
     @Environment(AppModel.self) private var model
     let item: ConfigItem
     let collectionID: String
 
-    // Preview (rendered markdown) vs. source (raw monospaced) toggle.
-    @State private var showSource = false
-
-    private var metadata: [DetailMetadataBar.Item] {
-        [
-            DetailMetadataBar.Item(
-                icon: item.source.iconName,
-                text: item.source.displayName,
-                tint: Theme.textSecondary
-            ),
-            DetailMetadataBar.Item(icon: "doc", text: CollectionsFmt.abbreviatePath(item.path)),
-            DetailMetadataBar.Item(icon: nil, text: CollectionsFmt.size(item.fileSize)),
-        ]
+    // Opening the create-collection modal is requested by posting the shared notification (the
+    // host CollectionsView listens for it), so a nested viewer's menu can still create one.
+    private func requestNewCollection(_: String) {
+        NotificationCenter.default.post(name: .cortexNewCollectionRequested, object: nil)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Detail toolbar: star, preview/source toggle, actions menu
-            CollectionMemberToolbar(
-                item: item,
-                collectionID: collectionID,
-                showSource: $showSource
-            )
-
-            Divider().overlay(Theme.stroke)
-
-            // Scrolling body: preview (markdown) or source (raw)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(item.name)
-                        .font(.cortexTitle)
-                        .foregroundStyle(Theme.textPrimary)
-                        .textSelection(.enabled)
-
-                    if !item.detail.isEmpty {
-                        Text(item.detail)
-                            .font(.system(size: 13))
-                            .foregroundStyle(Theme.textSecondary)
-                            .textSelection(.enabled)
-                    }
-
-                    if item.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("This file is empty.")
-                            .font(.system(size: 13))
-                            .foregroundStyle(Theme.textTertiary)
-                            .padding(.top, 8)
-                    } else if showSource {
-                        // Raw monospaced, selectable source
-                        Text(item.content)
-                            .font(.cortexMono)
-                            .foregroundStyle(Theme.textPrimary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 8)
-                    } else {
-                        MarkdownText(markdown: item.content)
-                            .padding(.top, 8)
-                    }
-                }
-                .padding(28)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        switch item.kind {
+        case .plugin:
+            PluginDetail(item: item)
+        case .mcp:
+            // MCP servers keep their own detail; resolve the real server behind the mapped id.
+            if let server = model.config.mcpServers.first(where: { $0.id == item.id }) {
+                MCPServerDetail(server: server)
+            } else {
+                ConfigItemDetail(item: item, tint: item.source.tint, requestNewCollection: requestNewCollection)
             }
-
-            // Pinned bottom metadata bar
-            DetailMetadataBar(leading: metadata, trailing: Fmt.relative(item.modified))
+        case .instruction:
+            InstructionDetail(item: item, requestNewCollection: requestNewCollection)
+        default:
+            // skills / agents / commands / rules (and any other markdown-backed kind) use the
+            // shared library document viewer, exactly as the Skills/Agents pages do.
+            ConfigItemDetail(item: item, tint: item.source.tint, requestNewCollection: requestNewCollection)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.canvas)
-        .id(item.id)
-    }
-}
-
-// MARK: - CollectionMemberToolbar
-//
-// Top-right detail controls: a favorite star toggle, a preview/source segmented
-// toggle (eye vs. code-brackets, the active one highlighted), and a Menu mirroring the
-// row context menu (favorite, collection membership, remove, show in Finder).
-
-private struct CollectionMemberToolbar: View {
-    @Environment(AppModel.self) private var model
-    let item: ConfigItem
-    let collectionID: String
-    @Binding var showSource: Bool
-
-    var body: some View {
-        HStack(spacing: 10) {
-            // Favorite star toggle
-            Button {
-                model.toggleFavorite(item.id)
-            } label: {
-                Image(systemName: "star")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(model.library.isFavorite(item.id) ? Theme.textPrimary : Theme.textSecondary)
-                    .frame(width: 26, height: 26)
-                    .background(Theme.hairFill, in: RoundedRectangle(cornerRadius: Theme.radiusSmall))
-            }
-            .buttonStyle(.plain)
-            .linkCursor()
-            .help(model.library.isFavorite(item.id) ? "Unfavorite" : "Favorite")
-
-            Spacer(minLength: 0)
-
-            // Preview / source toggle
-            HStack(spacing: 2) {
-                ToggleModeButton(icon: "eye", isActive: !showSource) { showSource = false }
-                ToggleModeButton(icon: "chevron.left.forwardslash.chevron.right", isActive: showSource) { showSource = true }
-            }
-            .padding(3)
-            .background(Theme.canvas.opacity(0.6), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-
-            // Actions menu (matches the row context menu)
-            Menu {
-                ItemLibraryMenu(item: item, currentCollectionID: collectionID)
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.textSecondary)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Item actions")
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity)
-    }
-}
-
-// MARK: - ToggleModeButton
-//
-// One segment of the preview/source toggle: an SF Symbol that highlights (raised fill
-// + primary tint) when its mode is active.
-
-private struct ToggleModeButton: View {
-    let icon: String
-    let isActive: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(isActive ? Theme.textPrimary : Theme.textSecondary)
-                .frame(width: 28, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(isActive ? Theme.cardRaised : .clear)
-                )
-        }
-        .buttonStyle(.plain)
-        .linkCursor()
     }
 }
 
@@ -631,6 +604,61 @@ private struct CollectionsEmptyPane: View {
     }
 }
 
+// MARK: - AddToCollectionMenu
+//
+// A reusable "Add to Collection" control, keyed by a plain item id, so ANY library entity
+// can join a collection - library items (ConfigItem.id), MCP servers (server.id), plugins -
+// since membership is stored as ids. Renders as a submenu inside a row `.contextMenu`, or,
+// with `compact: true`, as a small icon menu button for a detail toolbar. Each collection
+// toggles membership (checkmark when a member); "New Collection…" opens the create modal.
+
+struct AddToCollectionMenu: View {
+    @Environment(AppModel.self) private var model
+    let itemID: String
+    var compact: Bool = false
+
+    var body: some View {
+        Menu {
+            if model.library.collections.isEmpty {
+                Text("No collections yet")
+            }
+            ForEach(model.library.collections) { collection in
+                Button {
+                    model.toggleMember(itemID, in: collection.id)
+                } label: {
+                    if model.library.isMember(itemID, of: collection.id) {
+                        Label(collection.name, systemImage: "checkmark")
+                    } else {
+                        Text(collection.name)
+                    }
+                }
+            }
+            Divider()
+            Button {
+                // Create a new collection on the Collections page (opens its name modal).
+                model.route = .collections
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    NotificationCenter.default.post(name: .cortexNewCollectionRequested, object: nil)
+                }
+            } label: {
+                Label("New Collection\u{2026}", systemImage: "plus")
+            }
+        } label: {
+            if compact {
+                Image(systemName: "rectangle.stack.badge.plus")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.textSecondary)
+                    .frame(width: 30, height: 26)
+                    .contentShape(Rectangle())
+            } else {
+                Label("Add to Collection", systemImage: "rectangle.stack.badge.plus")
+            }
+        }
+        .menuIndicator(.hidden)
+        .help("Add to a collection")
+    }
+}
+
 // MARK: - Notification bridge
 //
 // The "New Collection..." entry inside the per-item Collections menu lives deep in the
@@ -639,29 +667,4 @@ private struct CollectionsEmptyPane: View {
 
 extension Notification.Name {
     static let cortexNewCollectionRequested = Notification.Name("cortex.newCollectionRequested")
-}
-
-// MARK: - CollectionsFmt
-//
-// File-size and home-relative path helpers for the member metadata bar (kept local so
-// CollectionsView is self-contained and does not depend on another feature file).
-
-enum CollectionsFmt {
-    private static let byteFormatter: ByteCountFormatter = {
-        let f = ByteCountFormatter()
-        f.countStyle = .file
-        f.allowedUnits = [.useBytes, .useKB, .useMB]
-        return f
-    }()
-
-    static func size(_ bytes: Int) -> String {
-        byteFormatter.string(fromByteCount: Int64(bytes))
-    }
-
-    static func abbreviatePath(_ path: String) -> String {
-        let home = NSHomeDirectory()
-        if path == home { return "~" }
-        if path.hasPrefix(home + "/") { return "~" + path.dropFirst(home.count) }
-        return path
-    }
 }

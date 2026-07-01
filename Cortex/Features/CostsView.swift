@@ -20,7 +20,7 @@ struct CostsView: View {
     @State private var showCostInfo = false
 
     // How the spend numbers are produced. Matches the Home Est. Cost tile's popover.
-    private static let costInfo = "Estimated locally from your Claude Code session transcripts (~/.claude). For each model, the input, output, and cache read/write token counts are multiplied by that model's published price per million tokens (Opus, Sonnet, and Haiku rates - override them in ~/.claude/readout-pricing.json) and summed.\n\nThis is the API-equivalent cost. On a Max or Pro subscription you aren't billed per token, so your actual bill may differ."
+    private static let costInfo = "Tokens from your Claude Code transcripts (~/.claude) multiplied by each model's published API price. Models without a published price count as $0 - set rates in ~/.claude/readout-pricing.json.\n\nThis is the API-equivalent cost; on a Max or Pro subscription your actual bill differs."
 
     var body: some View {
         // Windowed stats power the charts; the KPI header uses fixed windows.
@@ -28,34 +28,14 @@ struct CostsView: View {
 
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                // Page title + a "how this is calculated" info popover.
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 8) {
-                        Text("Costs")
-                            .font(.largeTitle.bold())
-                            .foregroundStyle(.primary)
-                        Button { showCostInfo.toggle() } label: {
-                            Image(systemName: "info.circle")
-                                .font(.title3)
-                                .foregroundStyle(.secondary)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .linkCursor()
-                        .help("How costs are calculated")
-                        .popover(isPresented: $showCostInfo, arrowEdge: .bottom) {
-                            Text(Self.costInfo)
-                                .font(.callout)
-                                .foregroundStyle(.primary)
-                                .frame(width: 320, alignment: .leading)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .padding(14)
-                        }
-                    }
-                    Text("What your Claude Code usage is costing you")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
+                // Title + subtitle live in the toolbar band (`.cortexPageChrome`); the
+                // "how costs are calculated" info popover moved to the band's trailing edge.
+
+                if !model.isReady {
+                    // Loading skeleton until the session data (KPIs + charts) is parsed, so
+                    // the page doesn't flash $0.00 placeholders on open.
+                    CostsSkeleton()
+                } else {
 
                 // All-time + this-month spend KPIs
                 CostKPIRow()
@@ -78,15 +58,62 @@ struct CostsView: View {
 
                 // Per-model cost + token breakdown table
                 ModelBreakdownCard(stats: stats)
+                }   // end else (model.isReady)
             }
-            .padding(28)
+            .padding(Theme.pageHInset)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Theme.canvas)
+        .cortexScrollEdge()
+        .cortexPageChrome("Costs", subtitle: "What your Claude Code usage is costing you") {
+            ToolbarItem(placement: .primaryAction) {
+                Button { showCostInfo.toggle() } label: {
+                    Image(systemName: "info.circle")
+                }
+                .help("How costs are calculated")
+                .popover(isPresented: $showCostInfo, arrowEdge: .bottom) {
+                    Text(Self.costInfo)
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                        .frame(width: 320, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(14)
+                }
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 WindowPicker(window: $window)
             }
+        }
+    }
+}
+
+// MARK: - Costs loading skeleton
+//
+// Shimmer placeholders shown until the heavy session parse completes, mirroring the real
+// layout (a 4-up KPI row, a paired chart row, and the daily-spend chart) so the crossfade
+// to real content isn't jarring - matching the Home / split-view skeletons.
+
+private struct CostsSkeleton: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(spacing: 14) {
+                ForEach(0..<4, id: \.self) { _ in
+                    SkeletonCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            SkeletonBlock(width: 84, height: 11, cornerRadius: 4)
+                            SkeletonBlock(width: 120, height: 22, cornerRadius: 5)
+                            SkeletonBlock(width: 64, height: 10, cornerRadius: 4)
+                        }
+                    }
+                }
+            }
+            HStack(alignment: .top, spacing: 14) {
+                SkeletonCard { SkeletonBlock(height: 180, cornerRadius: 8) }
+                SkeletonCard { SkeletonBlock(height: 180, cornerRadius: 8) }
+            }
+            SkeletonCard { SkeletonBlock(height: 150, cornerRadius: 8) }
         }
     }
 }

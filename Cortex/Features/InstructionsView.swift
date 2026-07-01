@@ -60,9 +60,16 @@ struct InstructionsView: View {
         SplitDetailView(
             items: filtered,
             selectedID: $selectedID,
+            title: ConfigKind.instruction.plural,
+            subtitle: ConfigKind.instruction.blurb,
+            count: filtered.count,
             emptyIcon: ConfigKind.instruction.icon,
             emptyTitle: "No instructions selected",
-            emptyMessage: "Select a CLAUDE.md or AGENTS.md on the left to read it."
+            emptyMessage: "Select a CLAUDE.md or AGENTS.md on the left to read it.",
+            // ⌘C copies the file path (Instructions are view-only in-app, so no ⌘E / ⌫).
+            actions: { item in
+                PageActions(copyPath: { model.copyPath(item.path) })
+            }
         ) {
             // Left-pane header: page title + live count + search + scope + sort filter
             InstructionsListHeader(count: filtered.count, query: $query, scope: $scope, scopes: scopes, sort: sortBinding)
@@ -142,21 +149,9 @@ private struct InstructionsListHeader: View {
     @Binding var sort: LibrarySort
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Title row: smaller page title (the name also shows in the toolbar) + count.
-            HStack(spacing: 8) {
-                Text(ConfigKind.instruction.plural)
-                    .font(.cortexTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 6)
-                Text("\(count)")
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            // Shared search + scope filter (Global / each project) + sort.
-            LibraryFilterBar(query: $query, placeholder: "Search instructions", scope: $scope, scopes: scopes, sort: $sort)
-        }
+        // Title + count + blurb now live in the toolbar band (`.cortexPageChrome`); the
+        // left pane keeps just the shared search / scope / sort filter.
+        LibraryFilterBar(query: $query, placeholder: "Search instructions", scope: $scope, scopes: scopes, sort: $sort)
     }
 }
 
@@ -253,7 +248,7 @@ private struct InstructionRow: View {
 // of LabeledContent metadata rows). Re-identified by item id so the scroll + toggle
 // reset on change.
 
-private struct InstructionDetail: View {
+struct InstructionDetail: View {
     let item: ConfigItem
     let requestNewCollection: (String) -> Void
 

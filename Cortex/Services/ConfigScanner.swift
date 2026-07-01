@@ -802,9 +802,12 @@ final class ConfigScanner {
         var byName: [String: MCPServer] = [:]
         var order: [String] = []
 
-        func ingest(_ pairs: [(String, [String: Any])], scope: String) {
+        // `file` is the JSON config the servers came from, remembered on each MCPServer so the
+        // detail pane can reveal it in Finder.
+        func ingest(_ pairs: [(String, [String: Any])], scope: String, file: URL) {
             for (name, value) in pairs where byName[name] == nil {
-                guard let server = makeServer(name: name, value: value, scope: scope, needsAuth: needsAuth)
+                guard let server = makeServer(name: name, value: value, scope: scope,
+                                              needsAuth: needsAuth, configPath: file.path)
                 else { continue }
                 byName[name] = server
                 order.append(name)
@@ -812,25 +815,112 @@ final class ConfigScanner {
         }
 
         // User-scope global config files first (these take precedence over project ones).
-        ingest(mcpServerObjects(at: home.appendingPathComponent(".claude.json")), scope: "user")
-        ingest(mcpServerObjects(at: claude.appendingPathComponent(".mcp.json")), scope: "user")
-        ingest(mcpServerObjects(at: claude.appendingPathComponent("mcp.json")), scope: "user")
-        ingest(mcpServerObjects(at: home.appendingPathComponent(".mcp.json")), scope: "user")
+        let userClaudeJSON = home.appendingPathComponent(".claude.json")
+        let userMCPClaudeDir = claude.appendingPathComponent(".mcp.json")
+        let userMCPClaudeDirAlt = claude.appendingPathComponent("mcp.json")
+        let userMCPHome = home.appendingPathComponent(".mcp.json")
+        ingest(mcpServerObjects(at: userClaudeJSON), scope: "user", file: userClaudeJSON)
+        ingest(mcpServerObjects(at: userMCPClaudeDir), scope: "user", file: userMCPClaudeDir)
+        ingest(mcpServerObjects(at: userMCPClaudeDirAlt), scope: "user", file: userMCPClaudeDirAlt)
+        ingest(mcpServerObjects(at: userMCPHome), scope: "user", file: userMCPHome)
 
         // Per-project mcpServers nested inside ~/.claude.json (projects.<path>.mcpServers).
-        for (projectPath, pairs) in projectScopedMCP(at: home.appendingPathComponent(".claude.json")) {
+        for (projectPath, pairs) in projectScopedMCP(at: userClaudeJSON) {
             let scope = URL(fileURLWithPath: projectPath).lastPathComponent
-            ingest(pairs, scope: scope)
+            ingest(pairs, scope: scope, file: userClaudeJSON)
         }
 
         // Each discovered project's own .mcp.json.
         for project in projects {
             let file = project.appendingPathComponent(".mcp.json")
-            ingest(mcpServerObjects(at: file), scope: project.lastPathComponent)
+            ingest(mcpServerObjects(at: file), scope: project.lastPathComponent, file: file)
         }
 
         return order.compactMap { byName[$0] }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Remove one MCP server entry from its config JSON, preserving everything else, and rewrite
+    /// the file atomically. Round-trips through JSONSerialization so the file always stays valid
+    /// JSON (never left half-written or malformed). Returns true when an entry was found+removed.
+    /// Looks in the file's top-level `mcpServers`, then in `projects.<path>.mcpServers` for the
+    /// project whose folder name matches `scope`.
+    nonisolated static func deleteMCPServer(name: String, scope: String, configPath: String) -> Bool {
+        let url = URL(fileURLWithPath: configPath)
+        guard let data = try? Data(contentsOf: url),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        var removed = false
+
+        // Top-level mcpServers (user-scope files + each project's own .mcp.json).
+        if var servers = root["mcpServers"] as? [String: Any], servers[name] != nil {
+            servers.removeValue(forKey: name)
+            root["mcpServers"] = servers
+            removed = true
+        }
+
+        // Project-nested (projects.<path>.mcpServers inside the home config): remove from the
+        // project whose folder name matches the server's scope.
+        if !removed, var projects = root["projects"] as? [String: Any] {
+            for (path, value) in projects {
+                guard URL(fileURLWithPath: path).lastPathComponent == scope,
+                      var pdict = value as? [String: Any],
+                      var servers = pdict["mcpServers"] as? [String: Any],
+                      servers[name] != nil else { continue }
+                servers.removeValue(forKey: name)
+                pdict["mcpServers"] = servers
+                projects[path] = pdict
+                root["projects"] = projects
+                removed = true
+                break
+            }
+        }
+
+        guard removed else { return false }
+        return writeJSON(root, to: url)
+    }
+
+    /// Uninstall a plugin from Claude Code's registry: remove its entry from
+    /// installed_plugins.json AND from settings.json's `enabledPlugins`. Both files are
+    /// round-tripped through JSONSerialization (always valid JSON) and written atomically;
+    /// cached plugin files under ~/.claude/plugins are left as-is (harmless). `rawKey` is the
+    /// "name@marketplace" identifier. Returns true when the plugin was found + removed.
+    nonisolated static func deletePlugin(rawKey: String) -> Bool {
+        let claude = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+        var changed = false
+
+        // 1) installed_plugins.json - the map may be wrapped under a "plugins" key.
+        let installedURL = claude.appendingPathComponent("plugins/installed_plugins.json")
+        if let data = try? Data(contentsOf: installedURL),
+           var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            if var wrapped = root["plugins"] as? [String: Any], wrapped[rawKey] != nil {
+                wrapped.removeValue(forKey: rawKey)
+                root["plugins"] = wrapped
+                changed = writeJSON(root, to: installedURL)
+            } else if root[rawKey] != nil {
+                root.removeValue(forKey: rawKey)
+                changed = writeJSON(root, to: installedURL)
+            }
+        }
+
+        // 2) settings.json - drop it from enabledPlugins too (best-effort; may already be absent).
+        let settingsURL = claude.appendingPathComponent("settings.json")
+        if let data = try? Data(contentsOf: settingsURL),
+           var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           var enabled = root["enabledPlugins"] as? [String: Any], enabled[rawKey] != nil {
+            enabled.removeValue(forKey: rawKey)
+            root["enabledPlugins"] = enabled
+            _ = writeJSON(root, to: settingsURL)
+        }
+
+        return changed
+    }
+
+    /// Atomic, valid-JSON write (pretty, stable key order, readable unescaped slashes).
+    private nonisolated static func writeJSON(_ obj: [String: Any], to url: URL) -> Bool {
+        guard let out = try? JSONSerialization.data(withJSONObject: obj,
+                                                    options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        else { return false }
+        do { try out.write(to: url, options: .atomic); return true } catch { return false }
     }
 
     /// Top-level "mcpServers" object from a JSON file, if any.
@@ -862,7 +952,7 @@ final class ConfigScanner {
 
     /// Build one MCPServer. stdio when a "command" is present, else sse/http by type/url.
     private nonisolated static func makeServer(
-        name: String, value: [String: Any], scope: String, needsAuth: Set<String>
+        name: String, value: [String: Any], scope: String, needsAuth: Set<String>, configPath: String
     ) -> MCPServer? {
         let auth = needsAuth.contains(name)
         if let command = (value["command"] as? String)?.nilIfEmpty {
@@ -871,7 +961,7 @@ final class ConfigScanner {
             return MCPServer(
                 id: name, name: name, transport: "stdio",
                 command: full, url: nil, scope: scope,
-                needsAuth: auth, toolCount: 0
+                needsAuth: auth, configPath: configPath
             )
         }
         if let url = (value["url"] as? String)?.nilIfEmpty {
@@ -880,7 +970,7 @@ final class ConfigScanner {
             return MCPServer(
                 id: name, name: name, transport: transport,
                 command: nil, url: url, scope: scope,
-                needsAuth: auth, toolCount: 0
+                needsAuth: auth, configPath: configPath
             )
         }
         return nil

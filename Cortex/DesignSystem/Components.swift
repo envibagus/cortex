@@ -410,37 +410,146 @@ struct RowLink<Leading: View, Trailing: View>: View {
     }
 }
 
+// MARK: - Page header (unified title-bar band)
+//
+// ONE page-title treatment for the whole app. The page name + optional count badge and a
+// quiet one-line subtitle render in the window's unified toolbar band via a `.navigation`
+// (leading-edge) toolbar item, NOT in the scrolling content, so the band is never an empty
+// strip and the title reads a touch larger than the tiny system title - matching the
+// Ports/Health pages the app is modelled on. (`.title` placement is iOS-only; on macOS
+// `.navigation` items sit at the toolbar's leading edge, exactly where the system title
+// would go.) Page controls (refresh, search, filters) go in `.primaryAction`. A soft
+// macOS 26 scroll-edge blur frosts the band as content scrolls beneath it.
+
+/// The custom title placed at the toolbar's leading edge: a slightly-larger bold page name
+/// with an optional count badge, over a one-line secondary subtitle. Sized to sit inside the
+/// unified toolbar band without clipping.
+struct CortexToolbarTitle: View {
+    let title: String
+    var count: Int? = nil
+    var subtitle: String? = nil
+    /// When true the subtitle shows inline under the title (Costs keeps its blurb visible);
+    /// otherwise the band stays compact (title + count only) and the subtitle is surfaced as
+    /// a hover tooltip on the title.
+    var subtitleInline: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                // Page name: a proper page heading, a few points over the ~13pt system title.
+                Text(title)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(Theme.textPrimary)
+                // Count badge (e.g. "27" on Ports): a quiet pill next to the title, so the
+                // number rides with the heading instead of the description line.
+                if let count {
+                    Text(Fmt.grouped(count))
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(Theme.textSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Theme.hairFill))
+                        .fixedSize()
+                }
+            }
+            if subtitleInline, let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+        // Line the title up with the page content's leading inset, not the toolbar edge.
+        .padding(.leading, Theme.titleLeadingInset)
+        // Subtitle-on-hover: when it isn't shown inline, reveal it as a tooltip.
+        .help(subtitleInline ? "" : (subtitle ?? ""))
+    }
+}
+
+extension View {
+    /// Standard page chrome with trailing toolbar actions: a larger title (+ optional count
+    /// badge + subtitle) placed in the toolbar band, plus the page's own `.primaryAction`
+    /// controls. `navigationTitle` stays set for the accessibility / window-menu label; the
+    /// `.title` toolbar item overrides only its VISUAL rendering.
+    func cortexPageChrome<A: ToolbarContent>(
+        _ title: String,
+        subtitle: String? = nil,
+        count: Int? = nil,
+        subtitleInline: Bool = false,
+        @ToolbarContentBuilder actions: () -> A
+    ) -> some View {
+        cortexTitleBand(title, subtitle: subtitle, count: count, subtitleInline: subtitleInline)
+            .toolbar { actions() }
+    }
+
+    /// Standard page chrome with no trailing actions.
+    func cortexPageChrome(_ title: String, subtitle: String? = nil, count: Int? = nil, subtitleInline: Bool = false) -> some View {
+        cortexTitleBand(title, subtitle: subtitle, count: count, subtitleInline: subtitleInline)
+    }
+
+    /// The leading page title in the band. On macOS 26 its Liquid Glass "shared background"
+    /// is hidden so the title reads as plain text on the band (same color as the content), not
+    /// a tinted capsule "bubble"; older macOS draws no such background, so it's used as-is.
+    @ViewBuilder
+    fileprivate func cortexTitleBand(_ title: String, subtitle: String?, count: Int?, subtitleInline: Bool) -> some View {
+        if #available(macOS 26.0, *) {
+            toolbar {
+                ToolbarItem(placement: .navigation) {
+                    CortexToolbarTitle(title: title, count: count, subtitle: subtitle, subtitleInline: subtitleInline)
+                }
+                .sharedBackgroundVisibility(.hidden)
+            }
+        } else {
+            toolbar {
+                ToolbarItem(placement: .navigation) {
+                    CortexToolbarTitle(title: title, count: count, subtitle: subtitle, subtitleInline: subtitleInline)
+                }
+            }
+        }
+    }
+
+    /// macOS 26 soft scroll-edge blur (Liquid Glass) at the top edge, so the toolbar band
+    /// frosts as content scrolls beneath it. No-op before macOS 26.
+    @ViewBuilder func cortexScrollEdge() -> some View {
+        if #available(macOS 26.0, *) {
+            scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self
+        }
+    }
+}
+
 // MARK: - Page scaffold
 //
-// Standard padded scroll container with a large title used by most feature views.
+// Standard padded scroll container for most feature views. The title/subtitle/count live in
+// the toolbar band (via `.cortexPageChrome`), NOT in the content, so the page starts flush
+// under the band with no empty strip; `toolbar` is the page's trailing control (usually a
+// refresh) and rides in the band's trailing edge.
 
 struct PageScaffold<Content: View>: View {
     var title: String
     var subtitle: String? = nil
+    var count: Int? = nil
     var toolbar: AnyView? = nil
     @ViewBuilder var content: Content
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(title).font(.cortexTitle).foregroundStyle(Theme.textPrimary)
-                        if let subtitle {
-                            Text(subtitle).font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
-                        }
-                    }
-                    Spacer()
-                    if let toolbar { toolbar }
-                }
                 content
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 14)
-            .padding(.bottom, 28)
+            .padding(.horizontal, Theme.pageHInset)
+            .padding(.top, Theme.pageTopInset)
+            .padding(.bottom, Theme.pageHInset)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Theme.canvas)
+        .cortexScrollEdge()
+        .cortexPageChrome(title, subtitle: subtitle, count: count) {
+            if let toolbar {
+                ToolbarItem(placement: .primaryAction) { toolbar }
+            }
+        }
     }
 }
 
@@ -461,8 +570,13 @@ struct CortexEmptyState: View {
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.textSecondary)
                 .multilineTextAlignment(.center)
+                // Cap the line length so a long message wraps to a readable column instead
+                // of stretching edge-to-edge across a wide pane.
+                .frame(maxWidth: 340)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
         .padding(.vertical, 48)
     }
 }
@@ -529,17 +643,31 @@ struct LibraryFilterBar<Sort: FilterSortOption>: View {
     @Binding var scope: String?
     var scopes: [String]
     @Binding var sort: Sort
+    // Optional provenance (origin) filter: only the config browsers pass it, and the
+    // pill only appears when more than one origin is present (so Agents/Commands, which
+    // never come from plugins, never show it).
+    var origin: Binding<String?>? = nil
+    var origins: [String] = []
     // ⌘F focuses this field (via model.focusSearchToken).
     @FocusState private var searchFocused: Bool
 
+    private var hasScopeFilter: Bool { scopes.count > 1 }
+    private var hasOriginFilter: Bool { origin != nil && origins.count > 1 }
+
     var body: some View {
-        if scopes.count > 1 {
-            // With a scope filter: search on its own row, then a [scope | sort] row.
+        if hasScopeFilter || hasOriginFilter {
+            // With a scope/origin filter: search on its own row, then a filter row of
+            // [scope | origin | sort] (each pill shown only when it applies).
             VStack(alignment: .leading, spacing: 9) {
                 searchField
                 LiquidGlassGroup(spacing: 8) {
                     HStack(spacing: 8) {
-                        ScopeFilterButton(scope: $scope, scopes: scopes)
+                        if hasScopeFilter {
+                            ScopeFilterButton(scope: $scope, scopes: scopes)
+                        }
+                        if hasOriginFilter, let origin {
+                            OriginFilterButton(origin: origin, origins: origins)
+                        }
                         SortFilterButton(sort: $sort)
                     }
                 }
@@ -867,6 +995,137 @@ private struct ScopePopover: View {
         let selected = scope == value
         return Button {
             scope = value
+            dismiss()
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: icon).font(.system(size: 12)).foregroundStyle(Theme.textSecondary).frame(width: 16)
+                Text(label).font(.system(size: 13)).foregroundStyle(Theme.textPrimary).lineLimit(1)
+                Spacer(minLength: 8)
+                if selected {
+                    Image(systemName: "checkmark").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.accent)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverHighlight()
+    }
+}
+
+// MARK: - Origin (provenance) filter
+//
+// Sentinel labels for the provenance filter, shared by the config browser (which
+// builds the origins list + filters on it) and the popover (which picks row icons):
+// "Yours" = authored by you (not shipped inside a plugin), "Any plugin" = from any
+// installed plugin/marketplace, and any other value is a specific plugin name.
+
+enum OriginFilter {
+    static let mine = "Yours"
+    static let anyPlugin = "Any plugin"
+}
+
+// The origin pill: an ICON-ONLY compact control (origins can be long plugin names, so the
+// pill shows just the glyph of the current selection + a chevron; the label lives in the
+// popover and in a hover tooltip). Opens the same searchable popover (All origins / Yours /
+// Any plugin / each plugin by name).
+private struct OriginFilterButton: View {
+    @Binding var origin: String?
+    let origins: [String]
+    @State private var open = false
+
+    // Glyph reflecting the CURRENT selection.
+    private var icon: String {
+        switch origin {
+        case .none: "square.grid.2x2"
+        case OriginFilter.mine: "person.crop.circle"
+        case OriginFilter.anyPlugin: "puzzlepiece.extension"
+        default: "puzzlepiece"
+        }
+    }
+
+    var body: some View {
+        Button { open = true } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                Image(systemName: "chevron.up.chevron.down").font(.system(size: 9, weight: .semibold))
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Theme.textSecondary)
+            .padding(.horizontal, 12)
+            .frame(height: FilterControl.height)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .glassPill()
+        .help(origin ?? "All origins")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            OriginPopover(origin: $origin, origins: origins) { open = false }
+        }
+    }
+}
+
+// The origin popover: a search field over a live-filtered list of provenance values.
+// Picking one applies it and dismisses. Mirrors ScopePopover's styling.
+private struct OriginPopover: View {
+    @Binding var origin: String?
+    let origins: [String]
+    let dismiss: () -> Void
+    @State private var query = ""
+    @FocusState private var focused: Bool
+
+    private var filtered: [String] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty ? origins : origins.filter { $0.localizedCaseInsensitiveContains(q) }
+    }
+
+    // Icon per provenance row: yours, any-plugin, or a specific plugin.
+    private func icon(for value: String) -> String {
+        switch value {
+        case OriginFilter.mine: "person.crop.circle"
+        case OriginFilter.anyPlugin: "puzzlepiece.extension"
+        default: "puzzlepiece"
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.textSecondary)
+                TextField("Filter origins", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14))
+                    .foregroundStyle(Theme.textPrimary)
+                    .focused($focused)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            Divider().overlay(Theme.stroke)
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    originRow(label: "All origins", icon: "square.grid.2x2", value: nil)
+                    ForEach(filtered, id: \.self) { value in
+                        originRow(label: value, icon: icon(for: value), value: value)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 280)
+        }
+        .frame(width: 260)
+        .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { focused = true } }
+    }
+
+    private func originRow(label: String, icon: String, value: String?) -> some View {
+        let selected = origin == value
+        return Button {
+            origin = value
             dismiss()
         } label: {
             HStack(spacing: 9) {

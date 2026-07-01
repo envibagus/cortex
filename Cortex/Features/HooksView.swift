@@ -29,7 +29,7 @@ struct HooksView: View {
     var body: some View {
         PageScaffold(
             title: "Hooks",
-            subtitle: "Shell commands Claude Code runs on lifecycle events"
+            subtitle: ConfigKind.hook.blurb
         ) {
             // Section header with the live total hook count
             SectionHeader(

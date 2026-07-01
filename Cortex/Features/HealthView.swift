@@ -45,13 +45,14 @@ struct HealthView: View {
 
                 tabContent
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 14)
-            .padding(.bottom, 28)
+            .padding(.horizontal, Theme.pageHInset)
+            .padding(.top, Theme.pageTopInset)
+            .padding(.bottom, Theme.pageHInset)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Theme.canvas)
-        .navigationTitle("Health")
+        .cortexScrollEdge()
+        .cortexPageChrome("Health", subtitle: "Workspace health and hygiene, from one live scan")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 HealthRefreshButton()

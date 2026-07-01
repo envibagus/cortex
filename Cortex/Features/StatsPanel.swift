@@ -128,9 +128,9 @@ private struct StatsStatGrid: View {
             // Four headline KPIs (one row): the rest live in the Library/Models tabs.
             StatsStatBox(label: window == .today ? "Contributions Today" : "Contributions",
                          value: "\(windowedContributions)", dot: Theme.blue,
-                         info: "Commits + PRs + issues + reviews, from your GitHub contribution graph. Not raw commits.")
+                         info: "Commits, PRs, issues, and reviews from your GitHub contribution graph.")
             StatsStatBox(label: "Est. Cost", value: Fmt.money(stats.totalCost), dot: Theme.orange,
-                         info: "Estimated locally from your Claude Code session transcripts (~/.claude). For each model, the input, output, and cache read/write token counts are multiplied by that model's published price per million tokens (Opus, Sonnet, and Haiku rates - override them in ~/.claude/readout-pricing.json) and summed.\n\nThis is the API-equivalent cost. On a Max or Pro subscription you aren't billed per token, so your actual bill may differ.")
+                         info: "Tokens from your Claude Code transcripts (~/.claude) multiplied by each model's published API price. Models without a published price count as $0 - set rates in ~/.claude/readout-pricing.json.\n\nThis is the API-equivalent cost; on a Max or Pro subscription your actual bill differs.")
             StatsStatBox(label: "Sessions", value: "\(stats.sessions)", dot: .secondary)
             StatsStatBox(label: "Total tokens", value: Fmt.compact(stats.totalTokens), dot: .secondary)
         }

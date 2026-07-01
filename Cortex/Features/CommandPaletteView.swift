@@ -2,7 +2,7 @@ import SwiftUI
 
 // MARK: - CommandPaletteView (⌘K)
 //
-// A Spotlight-style overlay that indexes the whole live stack and lets the user
+// A search-and-jump overlay that indexes the whole live stack and lets the user
 // jump anywhere with the keyboard. Beyond Route.allCases it indexes repos, skills,
 // agents, MCP servers, and ports, fuzzy-matches the query against their names and
 // keywords, and groups the ranked results by category with leading icons.
@@ -18,6 +18,10 @@ struct CommandPaletteView: View {
     // Query + focus + keyboard selection cursor.
     @State private var query = ""
     @State private var selection = 0
+    // Bumped ONLY by keyboard nav / query reset to request an auto-scroll to the selected
+    // row. Hovering a row updates `selection` (to highlight it) but must NOT bump this, so
+    // moving the mouse over rows never scrolls the list out from under the cursor.
+    @State private var scrollToken = 0
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -38,8 +42,8 @@ struct CommandPaletteView: View {
             // responder chain, so the input would open unfocused.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { focused = true }
         }
-        // Reset the cursor whenever the result set changes shape.
-        .onChange(of: query) { _, _ in selection = 0 }
+        // Reset the cursor (and scroll back to the top) whenever the result set changes shape.
+        .onChange(of: query) { _, _ in selection = 0; scrollToken += 1 }
     }
 
     // MARK: - Panel
@@ -88,17 +92,14 @@ struct CommandPaletteView: View {
                 .onKeyPress(.upArrow) { moveSelection(-1, in: resultCount); return .handled }
                 .onKeyPress(.downArrow) { moveSelection(1, in: resultCount); return .handled }
 
-            // Count chip while filtering, hotkey hint while idle.
+            // Idle hint only. No result-count chip: a bare number with no label read as a
+            // confusing "179" while typing.
             if query.isEmpty {
                 Text("⌘K")
                     .font(.cortexCaption)
                     .foregroundStyle(Theme.textTertiary)
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .background(Theme.canvas.opacity(0.6), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            } else if resultCount > 0 {
-                Text("\(resultCount)")
-                    .font(.cortexCaption)
-                    .foregroundStyle(Theme.textTertiary)
             }
         }
         .padding(.horizontal, 16)
@@ -125,7 +126,10 @@ struct CommandPaletteView: View {
                             PaletteRow(match: match, selected: index == selection) {
                                 activate(match)
                             }
-                            .id(index)
+                            // Identify by the match's STABLE id, not its flat position, so
+                            // changing the query never recycles a row's view onto a different
+                            // match under a mismatched section header.
+                            .id(match.id)
                             .onHover { if $0 { selection = index } }
                         }
                     }
@@ -133,9 +137,12 @@ struct CommandPaletteView: View {
                 .padding(.bottom, 8)
             }
             .frame(maxHeight: 420)
-            // Keep the highlighted row in view as the keyboard cursor moves.
-            .onChange(of: selection) { _, new in
-                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(new, anchor: .center) }
+            // Keep the highlighted row in view as the KEYBOARD cursor moves (scrollToken is
+            // bumped by moveSelection / query reset, never by hover) so mouse hover doesn't
+            // scroll the list.
+            .onChange(of: scrollToken) { _, _ in
+                guard selection >= 0, selection < flat.count else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(flat[selection].id, anchor: .center) }
             }
         }
     }
@@ -284,10 +291,22 @@ struct CommandPaletteView: View {
         }
 
         // Re-group while preserving rank order within each category.
-        return PaletteCategory.allCases.compactMap { category in
+        let grouped = PaletteCategory.allCases.compactMap { category -> PaletteGroup? in
             let matches = ranked.filter { $0.category == category }
             return matches.isEmpty ? nil : PaletteGroup(category: category, matches: matches)
         }
+
+        // Empty query = launcher: keep the fixed category order (Navigate first). With a query,
+        // float the group holding the strongest match to the top, so an exact hit (e.g. the
+        // "notion" MCP server) isn't buried under weaker fuzzy matches in higher-priority
+        // categories. `ranked` is already sorted best-first, so a category's earliest position
+        // in it is that category's best score.
+        guard !q.isEmpty else { return grouped }
+        var bestRank: [PaletteCategory: Int] = [:]
+        for (position, match) in ranked.enumerated() where bestRank[match.category] == nil {
+            bestRank[match.category] = position
+        }
+        return grouped.sorted { (bestRank[$0.category] ?? .max) < (bestRank[$1.category] ?? .max) }
     }
 
     // MARK: - Actions
@@ -299,6 +318,19 @@ struct CommandPaletteView: View {
     }
 
     private func activate(_ match: PaletteMatch) {
+        // Deep-link to the specific entity, not just its page. The id is "<type>:<itemId>";
+        // drop the first segment to recover the item's own id (which may itself contain
+        // colons, e.g. a "claude-plugin:..." skill id). Repos use repoSelectionHint; skills /
+        // agents / MCP use librarySelectionHint.
+        let itemID = match.id.firstIndex(of: ":").map { String(match.id[match.id.index(after: $0)...]) }
+        switch match.category {
+        case .repos:
+            model.repoSelectionHint = itemID
+        case .skills, .agents, .mcp:
+            model.librarySelectionHint = itemID
+        default:
+            break
+        }
         model.route = match.destination
         dismiss()
     }
@@ -306,6 +338,8 @@ struct CommandPaletteView: View {
     private func moveSelection(_ delta: Int, in count: Int) {
         guard count > 0 else { return }
         selection = (selection + delta + count) % count
+        // Keyboard-driven move: request a scroll so the selected row stays visible.
+        scrollToken += 1
     }
 
     private func dismiss() {
@@ -354,22 +388,27 @@ private struct PaletteRow: View {
 
                 Spacer(minLength: 8)
 
-                // Return hint on the active row, category chip otherwise.
-                if selected {
-                    Image(systemName: "return")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Theme.textSecondary)
-                } else {
-                    Text(match.category.title)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Theme.textTertiary)
-                }
+                // Type badge on EVERY row (Navigate / Repos / Skills / MCP / ...), tinted to
+                // the row's category so it reads as metadata at a glance. The active row is
+                // shown by the accent highlight below, so no separate return-key glyph.
+                Text(match.category.title)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(match.tint)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(match.tint.opacity(0.16)))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            // A clearly-visible accent highlight on the active row (the old faint card fill
+            // read as barely-there), with a matching hairline so it stands out.
             .background(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(selected ? Theme.card : .clear)
+                    .fill(selected ? Theme.accent.opacity(0.16) : .clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(selected ? Theme.accent.opacity(0.45) : .clear, lineWidth: 1)
             )
             .contentShape(Rectangle())
             .padding(.horizontal, 6)
@@ -435,6 +474,7 @@ private enum FuzzyMatch {
         var qi = 0
         var score = 0
         var lastMatch = -1
+        var maxGap = 0
         var ci = 0
 
         while ci < c.count && qi < q.count {
@@ -455,9 +495,12 @@ private enum FuzzyMatch {
                     }
                 }
 
-                // Penalize the gap skipped since the previous matched character.
+                // Penalize the gap skipped since the previous matched character, and remember
+                // the largest gap (used below to reject scattered pseudo-matches).
                 if lastMatch >= 0 {
-                    score -= min(8, (ci - lastMatch - 1))
+                    let gap = ci - lastMatch - 1
+                    maxGap = max(maxGap, gap)
+                    score -= min(8, gap)
                 }
 
                 lastMatch = ci
@@ -468,6 +511,14 @@ private enum FuzzyMatch {
 
         // The whole query must be consumed to count as a match.
         guard qi == q.count else { return Int.min }
+
+        // Reject SCATTERED matches: if two consecutive matched characters are too far apart,
+        // the query isn't a real substring/prefix - it just happens to appear in order (e.g.
+        // gibberish like "fafafafafaa"), so it falls through to the "No matches" empty state.
+        // The allowed gap scales with the candidate length: short titles stay strict, while
+        // longer keyword strings (name + detail + tags) tolerate a proportionally larger gap
+        // so a legitimate match spanning two words isn't wrongly dropped.
+        if maxGap > max(12, c.count / 3) { return Int.min }
 
         // Bonus for matching at the very front of the candidate.
         if c.starts(with: q) { score += 25 }

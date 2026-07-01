@@ -108,6 +108,23 @@ enum ConfigKind: String, CaseIterable, Identifiable, Codable, Hashable {
         case .instruction: "book.closed"
         }
     }
+
+    /// A one-line concept explanation shown as the page subtitle: what this kind IS
+    /// and, crucially, WHEN it activates (who triggers it). This is what tells a user
+    /// how Skills, Commands, Hooks, etc. actually differ at a glance.
+    var blurb: String {
+        switch self {
+        case .skill: "Capabilities the agent loads on demand"
+        case .agent: "Specialized subagents the agent delegates to"
+        case .command: "Reusable prompts you trigger with a slash"
+        case .rule: "Always-on guidance for the assistant"
+        case .mcp: "External tools and data the agent connects to"
+        case .hook: "Shell commands Claude Code runs on lifecycle events"
+        case .memory: "Notes that persist across sessions"
+        case .plugin: "Installed bundles of skills, commands, and hooks"
+        case .instruction: "Always-loaded steering docs like CLAUDE.md and AGENTS.md"
+        }
+    }
 }
 
 /// A skill / agent / command / rule discovered on disk.
@@ -126,6 +143,19 @@ struct ConfigItem: Identifiable, Sendable, Hashable {
     var frontmatter: [String: String]
 
     var scopeLabel: String { isGlobal ? "Global" : (projectName ?? "Project") }
+
+    /// The plugin an item was installed from, or nil when it is a local/authored file.
+    /// Plugin skills carry a canonical id of "claude-plugin:<plugin>/<skill>" (the
+    /// volatile version + marketplace name are dropped by dedup), so the plugin name is
+    /// the segment between the prefix and the first "/". Everything else is "yours".
+    var pluginName: String? {
+        let prefix = "claude-plugin:"
+        guard id.hasPrefix(prefix) else { return nil }
+        return id.dropFirst(prefix.count).split(separator: "/").first.map(String.init)
+    }
+
+    /// True when the item came from an installed plugin/marketplace, not authored locally.
+    var isFromPlugin: Bool { pluginName != nil }
 }
 
 extension Array where Element == ConfigItem {
@@ -162,7 +192,7 @@ struct MCPServer: Identifiable, Sendable, Hashable {
     var url: String?      // for sse / http
     var scope: String     // "user" | "project" | "global"
     var needsAuth: Bool
-    var toolCount: Int     // best-effort count of exposed tools, 0 if unknown
+    var configPath: String? = nil // JSON config file this server is defined in (Show in Finder)
 }
 
 extension Array where Element == MCPServer {
@@ -223,21 +253,26 @@ extension Array where Element == MemoryItem {
 // MARK: - Sessions & usage
 
 /// Token usage for a turn or aggregated across a session, parsed from
-/// `message.usage` in session JSONL.
+/// `message.usage` in session JSONL. Cache writes are split by TTL because the
+/// API bills them differently: 5-minute writes at 1.25x the input rate, 1-hour
+/// writes at 2x (the JSONL carries the split under `usage.cache_creation`).
 struct TokenUsage: Codable, Sendable, Equatable, Hashable {
     var input: Int = 0
     var output: Int = 0
     var cacheRead: Int = 0
-    var cacheWrite: Int = 0
+    var cacheWrite: Int = 0    // 5-minute TTL writes (plus writes with no TTL breakdown)
+    var cacheWrite1h: Int = 0  // 1-hour TTL writes
 
-    var total: Int { input + output + cacheRead + cacheWrite }
+    var cacheWriteTotal: Int { cacheWrite + cacheWrite1h }
+    var total: Int { input + output + cacheRead + cacheWrite + cacheWrite1h }
 
     static func + (lhs: TokenUsage, rhs: TokenUsage) -> TokenUsage {
         TokenUsage(
             input: lhs.input + rhs.input,
             output: lhs.output + rhs.output,
             cacheRead: lhs.cacheRead + rhs.cacheRead,
-            cacheWrite: lhs.cacheWrite + rhs.cacheWrite
+            cacheWrite: lhs.cacheWrite + rhs.cacheWrite,
+            cacheWrite1h: lhs.cacheWrite1h + rhs.cacheWrite1h
         )
     }
 
@@ -438,10 +473,21 @@ struct UsageStats: Sendable {
 // MARK: - Model pricing
 
 struct ModelPricing: Codable, Sendable, Hashable {
-    var input: Double      // USD per 1M tokens
+    var input: Double        // USD per 1M tokens
     var output: Double
-    var cacheRead: Double
-    var cacheWrite: Double
+    var cacheRead: Double    // 0.1x input
+    var cacheWrite: Double   // 5-minute TTL cache writes, 1.25x input
+    var cacheWrite1h: Double // 1-hour TTL cache writes, 2x input
+
+    init(input: Double, output: Double, cacheRead: Double, cacheWrite: Double,
+         cacheWrite1h: Double? = nil) {
+        self.input = input
+        self.output = output
+        self.cacheRead = cacheRead
+        self.cacheWrite = cacheWrite
+        // Published 1h rate is 2x input across models; derive it unless overridden.
+        self.cacheWrite1h = cacheWrite1h ?? input * 2
+    }
 }
 
 // MARK: - Repos

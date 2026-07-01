@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 // MARK: - SettingsView
 //
@@ -37,8 +38,12 @@ struct SettingsView: View {
     @FocusState private var nameFieldFocused: Bool
     // Tracks the in-flight "Refresh all data" action to disable the button.
     @State private var isRefreshing = false
-    // The selected settings tab, persisted so it survives leaving and reopening Settings
-    // (and across launches), driven by the Liquid Glass segmented control below.
+    // Retains the AVAudioPlayer while a completion-sound preview plays in Settings.
+    @State private var soundPreviewPlayer: AVAudioPlayer?
+    // The selected settings tab, driven by the Liquid Glass segmented control below. Opening
+    // Settings always starts on General (in-app button / cmd-,) unless a hint deep-links a
+    // specific tab (the menu bar opens straight to Menu Bar) - see `applyInitialTab()`. Stored
+    // so the control has a stable backing value; the initial tab is decided on each open.
     @AppStorage("settingsSelectedTab") private var selectedTabRaw = SettingsTab.general.rawValue
     private var selectedTab: SettingsTab { SettingsTab(rawValue: selectedTabRaw) ?? .general }
     private var selectedTabBinding: Binding<SettingsTab> {
@@ -53,7 +58,6 @@ struct SettingsView: View {
         case ai = "AI"
         case sidebar = "Sidebar"
         case setup = "Setup"
-        case data = "Data"
         case shortcuts = "Shortcuts"
         case about = "About"
         var id: String { rawValue }
@@ -78,10 +82,16 @@ struct SettingsView: View {
         // Match the app's canvas so the Settings background reads identically to the
         // rest of the app (the grouped section cards still sit on top).
         .background(Theme.canvas)
-        .navigationTitle("Settings")
+        .cortexScrollEdge()
+        .cortexPageChrome("Settings")
         .frame(minWidth: 520, idealWidth: 600, minHeight: 520)
-        .onAppear { syncDraftFromModel(); applyTabHint() }
-        .onChange(of: model.settingsTabHint) { _, _ in applyTabHint() }
+        .onAppear { syncDraftFromModel(); applyInitialTab() }
+        // A hint set WHILE Settings is already open (menu bar re-triggers) deep-links its tab.
+        // Ignore the nil that `applyTabHint` writes when it clears the hint, so it doesn't
+        // bounce an applied Menu Bar selection back to General.
+        .onChange(of: model.settingsTabHint) { _, hint in
+            if hint != nil { applyTabHint() }
+        }
         // Esc leaves Settings: go back to the previous page (or Home if there's no history).
         .onExitCommand {
             if model.canGoBack { model.goBack() } else { model.route = .readout }
@@ -95,19 +105,20 @@ struct SettingsView: View {
         switch selectedTab {
         case .general:
             Form {
-                appearanceSection
+                generalSection
                 identitySection
+                dataSection
+                scanRootsSection
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
         case .menuBar:
             Form {
+                menuBarBehaviorSection
                 menuBarIconSection
                 menuBarUsageSection
-                menuBarResetSection
-                menuBarRefreshSection
                 menuBarLiveActivitySection
-                menuBarBehaviorSection
+                menuBarCompletionSoundSection
                 menuBarShortcutSection
             }
             .formStyle(.grouped)
@@ -132,13 +143,6 @@ struct SettingsView: View {
                 CoreToolsSection()
                 AIToolsSection()
                 WhatCortexReadsSection()
-            }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-        case .data:
-            Form {
-                dataSection
-                scanRootsSection
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
@@ -169,15 +173,17 @@ struct SettingsView: View {
     private var shortcutsNavSection: some View {
         Section {
             shortcutRow("Jump to a sidebar page", ["\u{2318}", "1-9"])
+            shortcutRow("Move selection (sidebar or list)", ["\u{2191}", "\u{2193}"])
+            shortcutRow("Switch focus between sidebar and list", ["\u{21E5}"])
             shortcutRow("Back", ["\u{2318}", "["])
             shortcutRow("Forward", ["\u{2318}", "]"])
             shortcutRow("Assistant", ["\u{2318}", "L"])
-            shortcutRow("Toggle sidebar", ["\u{2318}", "\\"])
+            shortcutRow("Toggle sidebar", ["\u{2318}", "B"])
             shortcutRow("New item (Library pages)", ["\u{2318}", "N"])
         } header: {
             Text("Navigation")
         } footer: {
-            Text("\u{2318}1 through \u{2318}9 follow the sidebar top to bottom, so they adapt when you pin or hide pages.")
+            Text("\u{2318}1 through \u{2318}9 follow the sidebar top to bottom, so they adapt when you pin or hide pages. \u{2318}\\ also toggles the sidebar.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -244,7 +250,7 @@ struct SettingsView: View {
     // System / Light / Dark, bound directly to the @AppStorage("appearance") key
     // the app entry reads, so flipping it instantly re-applies preferredColorScheme.
 
-    private var appearanceSection: some View {
+    private var generalSection: some View {
         Section {
             // Liquid Glass segmented control (matches the rest of the app), bridged to
             // the String-backed @AppStorage key via a typed binding.
@@ -252,10 +258,12 @@ struct SettingsView: View {
                 GlassSegmentedControl(items: AppAppearance.allCases,
                                       selection: appearanceSelection) { $0.label }
             }
+            // Launch at login lives here (an app-level preference), not under Menu Bar.
+            Toggle("Launch at login", isOn: launchAtLoginBinding)
         } header: {
-            Text("Appearance")
+            Text("General")
         } footer: {
-            Text("System follows your macOS appearance; Light and Dark force a fixed theme.")
+            Text("System follows macOS; Light and Dark force a theme.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -321,7 +329,7 @@ struct SettingsView: View {
         } header: {
             Text("Assistant")
         } footer: {
-            Text("The chat Assistant runs on your chosen CLI - only installed engines are selectable. The model applies to Claude Code and can also be changed per-chat in the composer.")
+            Text("Only installed engines are selectable. The model can also be changed per chat.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -372,7 +380,7 @@ struct SettingsView: View {
         } header: {
             Text("AI Summaries")
         } footer: {
-            Text("Claude (Haiku) summarizes via your local Claude Code CLI - cheap and uses your existing login. Apple Intelligence runs on-device (macOS 26, Apple silicon). Off falls back to the raw description.")
+            Text("Writes the short agent and session summaries. Apple Intelligence runs on-device; Off uses the raw description.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -403,7 +411,7 @@ struct SettingsView: View {
     private var sidebarSection: some View {
         Group {
             Section {
-                Text("Turn a destination off to hide it from the sidebar (everything is shown by default). Use the Pin button to lift a destination into a \u{201C}Pinned\u{201D} group at the top of the sidebar. Home and Settings can't be hidden.")
+                Text("Hide destinations, or pin them to a group at the top. Home and Settings always stay.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -490,7 +498,7 @@ struct SettingsView: View {
         } header: {
             Text("Identity")
         } footer: {
-            Text("Defaults to your macOS account name. Type to set a custom name, or clear it to fall back to the GitHub CLI name.")
+            Text("Defaults to your macOS account name; clear to reset.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -551,7 +559,7 @@ struct SettingsView: View {
     private var scanRootsSection: some View {
         Section {
             if model.scanRoots.isEmpty {
-                Text("No scan roots configured. Add a folder to scan for local repositories.")
+                Text("No directories added yet. Add a folder that holds your projects and Cortex will scan it for git repositories.")
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(model.scanRoots, id: \.self) { root in
@@ -585,9 +593,9 @@ struct SettingsView: View {
             }
             .linkCursor()
         } header: {
-            Text("Scan Roots")
+            Text("Scanned Directories")
         } footer: {
-            Text("Cortex looks for git repositories directly inside these directories.")
+            Text("Folders Cortex scans for git repositories, one level deep. Repos found here appear in Repos, Work Graph, and Diffs.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -628,7 +636,7 @@ struct SettingsView: View {
         } header: {
             Text("About")
         } footer: {
-            Text("Cortex checks GitHub for a newer release on launch. Updates are installed manually (download and replace) until the app is notarized.")
+            Text("Checks GitHub for updates on launch. Install manually (download and replace).")
                 .foregroundStyle(.secondary)
         }
     }
@@ -663,6 +671,14 @@ struct SettingsView: View {
     // controls / toggles the rest of Settings uses. Live activity is the one switch that
     // writes outside Cortex (it installs Claude Code hooks), so its footer says so.
 
+    /// Decide the tab on each open: a hint (e.g. the menu bar deep-links Menu Bar) wins,
+    /// otherwise always start on General so the in-app button / cmd-, entry is predictable
+    /// rather than reopening whatever tab was last viewed.
+    private func applyInitialTab() {
+        if model.settingsTabHint != nil { applyTabHint() }
+        else { selectedTabRaw = SettingsTab.general.rawValue }
+    }
+
     /// Land on a specific tab when Settings is opened with a hint (clears the hint).
     private func applyTabHint() {
         guard let raw = model.settingsTabHint, let tab = SettingsTab(rawValue: raw) else { return }
@@ -692,27 +708,20 @@ struct SettingsView: View {
         } header: {
             Text("Menu Bar Icon")
         } footer: {
-            Text("Number shows the percent, Ring draws a progress ring, Bars stacks Session over Weekly. Track picks which limit the number / ring follows.")
+            Text("Pick the icon style and which limit it tracks.")
                 .foregroundStyle(.secondary)
         }
     }
 
+    // One "Usage" group for everything about the usage readout: how percentages read,
+    // whether spend shows, how reset timers display, and how often limits re-check. Kept
+    // together so the Menu Bar tab isn't a long stack of one-row cards.
     private var menuBarUsageSection: some View {
         Section {
             choiceRow("Show") {
                 GlassSegmentedControl(items: UsageDisplayMode.allCases, selection: usageModeBinding) { $0.label }
             }
             Toggle("Show spend in panel", isOn: showSpendBinding)
-        } header: {
-            Text("Usage")
-        } footer: {
-            Text("Glass half full or half empty: read percentages as the amount used or the amount left. Applies to the menu bar, the home card, and the Usage page.\n\nShow spend adds the today / last 7 / last 30 days cost and tokens to the dropdown panel; turn it off to keep dollar amounts off the menu bar.")
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var menuBarResetSection: some View {
-        Section {
             choiceRow("Reset times") {
                 GlassSegmentedControl(items: ResetTimerStyle.allCases, selection: resetStyleBinding) { $0.label }
             }
@@ -721,23 +730,13 @@ struct SettingsView: View {
                     GlassSegmentedControl(items: MenuBarTimeFormat.allCases, selection: timeFormatBinding) { $0.label }
                 }
             }
-        } header: {
-            Text("Reset Timers")
-        } footer: {
-            Text("Relative shows a countdown (\u{201C}Resets in 1h 44m\u{201D}); Absolute shows the clock time (\u{201C}Resets today at 11:04\u{201D}).")
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var menuBarRefreshSection: some View {
-        Section {
             choiceRow("Auto refresh") {
                 GlassSegmentedControl(items: MenuBarRefreshInterval.allCases, selection: refreshIntervalBinding) { $0.label }
             }
         } header: {
-            Text("Refresh")
+            Text("Usage")
         } footer: {
-            Text("How often Cortex re-checks your limits while it is running.")
+            Text("Show percentages as used or left. Reset times show a countdown or a clock time. Auto refresh sets how often limits re-check.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -745,8 +744,9 @@ struct SettingsView: View {
     private var menuBarLiveActivitySection: some View {
         Section {
             Toggle("Show live activity", isOn: liveActivityBinding)
+            // Confetti only fires while live activity is on, so the toggle is only relevant then.
             if model.menuBarLiveActivityEnabled {
-                Toggle("Play completion sound", isOn: completionSoundBinding)
+                Toggle("Show confetti when a turn finishes", isOn: confettiBinding)
             }
             if let error = model.activity.lastError {
                 Label(error, systemImage: "exclamationmark.triangle")
@@ -757,7 +757,46 @@ struct SettingsView: View {
         } header: {
             Text("Live Activity")
         } footer: {
-            Text("Shows what Claude Code is doing right now (Editing, Running command, Awaiting permission) with a turn timer. This installs Claude Code hooks in ~/.claude/settings.json - Cortex backs the file up first and removes its entries cleanly when you turn this off. It is the only file Cortex writes; everything else stays read-only.")
+            Text("Shows running sessions and a turn timer in the menu bar. Installs Claude Code hooks in ~/.claude/settings.json (backed up first, removed cleanly when off) - the only file Cortex writes.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // Completion sound stands on its own: it can be on even when the live-activity display is
+    // off (both share the same turn-detection hooks under the hood).
+    private var menuBarCompletionSoundSection: some View {
+        Section {
+            Toggle("Play completion sound", isOn: completionSoundBinding)
+            if model.menuBarCompletionSound {
+                LabeledContent("Sound") {
+                    HStack(spacing: 8) {
+                        // Small play button to preview the chosen sound on demand.
+                        Button {
+                            previewCompletionSound(model.menuBarCompletionSoundName)
+                        } label: {
+                            Image(systemName: "play.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Preview sound")
+
+                        Picker("", selection: completionSoundNameBinding) {
+                            ForEach(Self.completionSoundPacks, id: \.file) { pack in
+                                Text(pack.label).tag(pack.file)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                }
+                // Also preview the moment the selection changes, so picking is audible.
+                .onChange(of: model.menuBarCompletionSoundName) { _, name in
+                    previewCompletionSound(name)
+                }
+            }
+        } header: {
+            Text("Completion Sound")
+        } footer: {
+            Text("Chimes when a turn finishes, even with live activity off. Quick turns stay silent. Uses the same hooks as live activity.")
                 .foregroundStyle(.secondary)
         }
     }
@@ -765,7 +804,6 @@ struct SettingsView: View {
     private var menuBarBehaviorSection: some View {
         Section {
             Toggle("Show in menu bar", isOn: showMenuBarItemBinding)
-            Toggle("Launch at login", isOn: launchAtLoginBinding)
         } header: {
             Text("Behavior")
         } footer: {
@@ -812,6 +850,34 @@ struct SettingsView: View {
     }
     private var completionSoundBinding: Binding<Bool> {
         Binding(get: { model.menuBarCompletionSound }, set: { model.menuBarCompletionSound = $0 })
+    }
+    private var confettiBinding: Binding<Bool> {
+        Binding(get: { model.menuBarConfetti }, set: { model.menuBarConfetti = $0 })
+    }
+    private var completionSoundNameBinding: Binding<String> {
+        Binding(get: { model.menuBarCompletionSoundName }, set: { model.menuBarCompletionSoundName = $0 })
+    }
+
+    // The nine completion-sound packs (bundled hero-complete-<file>.caf), by friendly name.
+    private static let completionSoundPacks: [(file: String, label: String)] = [
+        ("hero-complete-soft", "Soft"),
+        ("hero-complete-aero", "Aero"),
+        ("hero-complete-arcade", "Arcade"),
+        ("hero-complete-organic", "Organic"),
+        ("hero-complete-glass", "Glass"),
+        ("hero-complete-industrial", "Industrial"),
+        ("hero-complete-minimal", "Minimal"),
+        ("hero-complete-retro", "Retro"),
+        ("hero-complete-crisp", "Crisp"),
+    ]
+
+    /// Preview a completion sound when the user picks it, so the choice is audible at once.
+    private func previewCompletionSound(_ name: String) {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "caf"),
+              let player = try? AVAudioPlayer(contentsOf: url) else { return }
+        player.prepareToPlay()
+        player.play()
+        soundPreviewPlayer = player
     }
     private var showSpendBinding: Binding<Bool> {
         Binding(get: { model.menuBarShowSpend }, set: { model.menuBarShowSpend = $0 })
@@ -1103,7 +1169,7 @@ private struct AIToolsSection: View {
         } header: {
             Text("AI Tools Detected")
         } footer: {
-            Text("\(checks.filter(\.isReady).count) of \(checks.count) configured. Cortex is built around Claude Code, but it notes which other tools you have set up so the picture is complete.")
+            Text("\(checks.filter(\.isReady).count) of \(checks.count) configured. Cortex is built around Claude Code and notes the other tools it finds.")
                 .foregroundStyle(.secondary)
         }
     }

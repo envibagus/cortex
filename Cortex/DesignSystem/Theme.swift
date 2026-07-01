@@ -77,6 +77,23 @@ enum Theme {
     static let radiusSmall: CGFloat = 7
     static let cardPadding: CGFloat = 20
 
+    // The ONE horizontal inset for page content, app-wide: every page's content (scroll
+    // pages, split list + detail panes, headers) uses this so the left/right gutters line
+    // up screen-to-screen, and the toolbar-band title lines up with it via
+    // `titleLeadingInset`. `pageTopInset` is the gap below the title-bar band.
+    static let pageHInset: CGFloat = 18
+    static let pageTopInset: CGFloat = 16
+    /// Leading pad for the toolbar-band page title, tuned so its text lines up with the
+    /// page content's `pageHInset` left edge. The unified toolbar insets its leading
+    /// content by ~9pt of its own (measured on screen), so this is `pageHInset - 9` to
+    /// land the title text on the `pageHInset` edge.
+    static let titleLeadingInset: CGFloat = pageHInset - 9
+    /// Row insets for the custom split-pane lists (SplitDetailView, Collections). The
+    /// native `.plain` List indents row content by ~8pt of its own (measured on screen),
+    /// so this is `pageHInset - 8` to land the rounded selection highlight exactly on the
+    /// `pageHInset` edge, flush with the filter bar's search field above it.
+    static let splitListRowInset: CGFloat = pageHInset - 8
+
     /// Heatmap intensity ramp (level 0...4).
     static func heatColor(_ level: Int) -> Color {
         switch max(0, min(4, level)) {

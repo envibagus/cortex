@@ -25,12 +25,8 @@ struct AssistantView: View {
         @Bindable var model = model
 
         VStack(spacing: 0) {
-            // Header: explains the assistant's scope + New Chat action.
-            assistantHeader
-
-            Divider().overlay(Theme.stroke)
-
-            // Body: either the unavailable empty state or the live conversation.
+            // Body: either the unavailable empty state or the live conversation. The title
+            // and the History / New Chat controls now live in the toolbar band.
             if !model.chat.isAvailable {
                 unavailableState
             } else {
@@ -39,36 +35,24 @@ struct AssistantView: View {
             }
         }
         .background(Theme.canvas)
+        .cortexScrollEdge()
+        .cortexPageChrome("Assistant") {
+            ToolbarItem(placement: .primaryAction) {
+                // History (reopen a past chat) then New Chat, wrapped in a glass group so
+                // the two Liquid Glass pills render together, matching the app's controls.
+                LiquidGlassGroup(spacing: 8) {
+                    HStack(spacing: 8) {
+                        historyButton
+                        newChatButton
+                    }
+                }
+            }
+        }
         // Opening Assistant (incl. via cmd+L) focuses the composer so you can type at once.
         .onAppear { if model.chat.isAvailable { composerFocused = true } }
     }
 
-    // MARK: - Header
-
-    private var assistantHeader: some View {
-        HStack(alignment: .center, spacing: 12) {
-            // Just the page title (no scope line - the empty-state ConversationIntro
-            // already states the assistant's reach, so repeating it here was redundant).
-            Text("Assistant")
-                .font(.cortexTitle)
-                .foregroundStyle(Theme.textPrimary)
-
-            Spacer(minLength: 12)
-
-            // History (reopen a past chat) then New Chat (clears the transcript). Wrapped
-            // in a glass group so the two Liquid Glass pills render together and blend,
-            // matching the app's other glass controls (refresh, scope/sort pills).
-            LiquidGlassGroup(spacing: 8) {
-                HStack(spacing: 8) {
-                    historyButton
-                    newChatButton
-                }
-            }
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 18)
-        .background(Theme.canvas)
-    }
+    // MARK: - Header controls (rendered in the toolbar band via `.cortexPageChrome`)
 
     // History button: opens a popover of saved past conversations to reopen or delete.
     private var historyButton: some View {
@@ -123,7 +107,7 @@ struct AssistantView: View {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     if model.chat.messages.isEmpty {
                         // First-run prompt suggestions.
-                        ConversationIntro(userName: model.userName, onSelect: sendPrompt)
+                        ConversationIntro(onSelect: sendPrompt)
                             .padding(.top, 8)
                     }
 
@@ -142,7 +126,9 @@ struct AssistantView: View {
                             .id(Self.thinkingAnchor)
                     }
                 }
-                .padding(.horizontal, 28)
+                // Match the page-title inset so the intro, chips, and message bubbles all
+                // line up with the "Assistant" title down the left edge.
+                .padding(.horizontal, Theme.pageHInset)
                 .padding(.vertical, 24)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -479,29 +465,25 @@ private struct ChatHistoryRow: View {
 // Friendly first-run state shown when the transcript is empty.
 
 private struct ConversationIntro: View {
-    let userName: String
     var onSelect: (String) -> Void = { _ in }
 
-    // Starter prompts that hint at the assistant's reach across the stack.
+    // Starter prompts that hint at the assistant's reach across the stack. Each one is
+    // answerable from the live context the assistant is grounded in (costs, per-project
+    // config rollup, repos, ports) - no prompt promises data the model can't see.
     // Chip glyphs are chrome: outline + grayscale (.secondary).
     private let prompts: [(icon: String, tint: Color, text: String)] = [
         ("dollarsign.circle", Theme.textSecondary, "How much have I spent on Claude this month?"),
-        ("bolt", Theme.textSecondary, "Which of my skills haven't I used lately?"),
+        ("bolt", Theme.textSecondary, "Which project has the most skills and agents?"),
         ("folder", Theme.textSecondary, "Summarize the state of my repos."),
         ("point.3.connected.trianglepath.dotted", Theme.textSecondary, "What's listening on my dev ports right now?"),
     ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            // Greeting + scope.
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Hey, \(userName)")
-                    .font(.cortexTitle)
-                    .foregroundStyle(Theme.textPrimary)
-                Text("Ask me anything about your local AI setup. I read your live sessions, costs, config, and repos.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Theme.textSecondary)
-            }
+            // Informational lead-in (no personal greeting), kept small.
+            Text("Ask me anything about your local AI setup. I read your live sessions, costs, config, and repos.")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textSecondary)
 
             // Suggested prompts: clickable, each sized to its own text.
             VStack(alignment: .leading, spacing: 8) {

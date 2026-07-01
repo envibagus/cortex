@@ -13,11 +13,15 @@ import MarkdownUI
 
 struct MarkdownText: View {
     let markdown: String
+    // Syntax highlighting is applied a beat AFTER the text is on screen: code renders plain
+    // immediately (instant) and colorizes ~1.5s later. This keeps switching between large,
+    // code-heavy documents snappy without losing the highlighter.
+    @State private var highlightReady = false
 
     var body: some View {
         Markdown(Self.stripped(markdown))
             .markdownTheme(.cortex)
-            .markdownCodeSyntaxHighlighter(CortexCodeHighlighter())
+            .markdownCodeSyntaxHighlighter(CortexCodeHighlighter(enabled: highlightReady))
             // Minimal table chrome: horizontal hairlines only (no full grid) + subtle zebra.
             .markdownTableBorderStyle(
                 TableBorderStyle(
@@ -30,6 +34,15 @@ struct MarkdownText: View {
                 .alternatingRows(Color.clear, Color.secondary.opacity(0.05))
             )
             .textSelection(.enabled)
+            // Colorize the code a beat after render. Re-armed on every content change, so it
+            // also holds off while an assistant reply is still streaming in. Cancelled when
+            // the view is torn down (e.g. moving to another item), so scrubbing never pays it.
+            .task(id: markdown) {
+                highlightReady = false
+                try? await Task.sleep(for: .milliseconds(1500))
+                guard !Task.isCancelled else { return }
+                highlightReady = true
+            }
     }
 
     static func stripped(_ md: String) -> String {
@@ -65,9 +78,32 @@ struct MarkdownText: View {
         "true", "false", "null", "nil", "None", "True", "False", "self", "this",
     ]
 
+    // Bounded cache of highlighted blocks, keyed by the raw code, so re-renders of the same
+    // document (scrolling, preview/source toggle, re-selecting the item) reuse the result
+    // instead of re-scanning it character by character. Accessed only from the main thread
+    // (MarkdownUI runs the highlighter during SwiftUI rendering).
+    private static var highlightCache: [String: AttributedString] = [:]
+    private static let highlightCacheLimit = 256
+    // Safety valve only: a pathologically huge block (tens of thousands of chars) would
+    // stutter the per-character scan even when deferred, so above this it stays plain. Real
+    // command / skill code blocks are far smaller, so they always get highlighted.
+    private static let maxHighlightLength = 20000
+
     /// Highlight a fenced code block: strings green, comments gray, keywords / HTTP
-    /// verbs orange, numbers purple. Heuristic and language-agnostic.
+    /// verbs orange, numbers purple. Heuristic and language-agnostic. Capped + memoized so
+    /// switching between large documents stays fast.
     static func highlight(_ code: String) -> AttributedString {
+        if code.count > maxHighlightLength { return AttributedString(code) }
+        if let cached = highlightCache[code] { return cached }
+        let result = buildHighlight(code)
+        // Simple bound: drop the whole cache when it grows too large (cheap, and these are
+        // short-lived per document) rather than tracking an LRU.
+        if highlightCache.count >= highlightCacheLimit { highlightCache.removeAll(keepingCapacity: true) }
+        highlightCache[code] = result
+        return result
+    }
+
+    private static func buildHighlight(_ code: String) -> AttributedString {
         var out = AttributedString()
         let lines = code.components(separatedBy: "\n")
         for (i, line) in lines.enumerated() {
@@ -152,8 +188,12 @@ struct MarkdownText: View {
 // MARK: - Code syntax highlighter bridge
 
 struct CortexCodeHighlighter: CodeSyntaxHighlighter {
+    // When false the code renders plain (instant); MarkdownText flips this on a beat after
+    // the text is on screen, so switching documents stays fast but the color still arrives.
+    var enabled: Bool = true
+
     func highlightCode(_ code: String, language: String?) -> Text {
-        Text(MarkdownText.highlight(code))
+        enabled ? Text(MarkdownText.highlight(code)) : Text(code)
     }
 }
 

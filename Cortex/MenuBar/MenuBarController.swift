@@ -136,8 +136,9 @@ final class MenuBarController: NSObject {
 
         // A finished turn is celebrated with a one-shot confetti burst plus a green "Done".
         // Fire it once, on the transition into `.done` - but not while several sessions run
-        // (it would fire whenever any one of them finishes a turn).
-        let celebrating = live && act.state == .done && !multiRunning
+        // (it would fire whenever any one of them finishes a turn), and only when the user
+        // hasn't turned the confetti off.
+        let celebrating = live && model.menuBarConfetti && act.state == .done && !multiRunning
         if celebrating && !wasCelebrating { celebrate() }
         wasCelebrating = celebrating
 
@@ -239,6 +240,9 @@ final class MenuBarController: NSObject {
             case .done:
                 // Green "Done" alongside the confetti burst.
                 runs.append(.init(text: "  Done", color: .systemGreen, weight: .semibold))
+            case .error:
+                // Red "Error": the turn ended on an API error, not a success (no confetti).
+                runs.append(.init(text: "  Error", color: .systemRed, weight: .semibold))
             case .awaitingPermission:
                 leadingGlyph = nil
                 leadingDot = .systemYellow
@@ -255,6 +259,13 @@ final class MenuBarController: NSObject {
 
     /// The trailing activity label + timer used by the image-based modes.
     private func activitySegment(_ act: ClaudeActivity) -> NSAttributedString {
+        // A failed turn: a red "Error" flash instead of the green "Done".
+        if act.state == .error {
+            return NSAttributedString(string: " Error", attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: NSColor.systemRed,
+            ])
+        }
         // The turn-complete flash: a green "Done" alongside the confetti burst.
         if act.state == .done {
             return NSAttributedString(string: " Done", attributes: [

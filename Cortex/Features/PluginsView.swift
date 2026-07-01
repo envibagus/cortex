@@ -51,9 +51,16 @@ struct PluginsView: View {
         SplitDetailView(
             items: filtered,
             selectedID: $selectedID,
+            title: ConfigKind.plugin.plural,
+            subtitle: ConfigKind.plugin.blurb,
+            count: filtered.count,
             emptyIcon: ConfigKind.plugin.icon,
             emptyTitle: "No plugins selected",
-            emptyMessage: "Select a plugin on the left to see its details."
+            emptyMessage: "Select a plugin on the left to see its details.",
+            // ⌘C copies the plugin's install path (plugins aren't edited/deleted in-app).
+            actions: { item in
+                PageActions(copyPath: { model.copyPath(item.path) })
+            }
         ) {
             // Left-pane header: page title + live count + search + scope + sort filter
             PluginsListHeader(count: filtered.count, query: $query, scope: $scope, scopes: scopes, sort: sortBinding)
@@ -62,6 +69,8 @@ struct PluginsView: View {
             // so this MUST NOT be wrapped in SelectableRow or a custom background.
             PluginRow(item: item)
                 .contextMenu {
+                    AddToCollectionMenu(itemID: item.id)
+                    Divider()
                     Button {
                         NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
                     } label: {
@@ -101,21 +110,9 @@ private struct PluginsListHeader: View {
     @Binding var sort: LibrarySort
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Title row: smaller page title (name also shows in the toolbar) + count.
-            HStack(spacing: 8) {
-                Text(ConfigKind.plugin.plural)
-                    .font(.cortexTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 6)
-                Text("\(count)")
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            // Shared search + scope filter (Global / each project) + sort.
-            LibraryFilterBar(query: $query, placeholder: "Search plugins", scope: $scope, scopes: scopes, sort: $sort)
-        }
+        // Title + count + blurb now live in the toolbar band (`.cortexPageChrome`); the
+        // left pane keeps just the shared search / scope / sort filter.
+        LibraryFilterBar(query: $query, placeholder: "Search plugins", scope: $scope, scopes: scopes, sort: $sort)
     }
 }
 
@@ -205,7 +202,7 @@ private struct PluginRow: View {
 // no preview/source toggle, so the body always renders the markdown preview.
 // Re-identified by item id so the scroll resets on change.
 
-private struct PluginDetail: View {
+struct PluginDetail: View {
     let item: ConfigItem
 
     var body: some View {
@@ -246,28 +243,72 @@ private struct PluginDetail: View {
 // MARK: - PluginActionBar
 //
 // The detail pane's floating top-right accessory (passed to NativeDocumentDetail as
-// `topTrailing`). Plugins have no library home, so this is just a quiet Show in Finder
-// button (the native idiom for revealing the backing file/folder), in a glass pill so
-// it matches the other browsers' floating toolbars.
+// `topTrailing`). Grouped in a liquid-glass pill matching the other browsers' floating
+// toolbars: favorite the plugin, add it to a collection, and reveal its folder in Finder.
 
 private struct PluginActionBar: View {
+    @Environment(AppModel.self) private var model
     let item: ConfigItem
+    // Drives the native uninstall-confirmation alert (set by the Remove Plugin… menu item).
+    @State private var confirmingDelete = false
 
     var body: some View {
-        // Reveal the backing file in Finder.
-        Button {
-            NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
-        } label: {
-            Image(systemName: "folder")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 30, height: 26)
-                .contentShape(Rectangle())
+        // Matches the Skills / Agents detail design language: ONE glass pill holding the
+        // favorite star + an ellipsis menu (add-to-collection, Show in Finder, Remove Plugin),
+        // rather than several separate buttons.
+        LiquidGlassGroup(spacing: 8) {
+            HStack(spacing: 2) {
+                StarButton(item: item)
+
+                Menu {
+                    AddToCollectionMenu(itemID: item.id)
+                    Divider()
+                    Button {
+                        NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
+                    } label: {
+                        Label("Show in Finder", systemImage: "folder")
+                    }
+                    Divider()
+                    Button(role: .destructive) { confirmingDelete = true } label: {
+                        Label("Remove Plugin\u{2026}", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 30, height: 26)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Plugin actions")
+            }
+            .padding(4)
+            .glassPill()
         }
-        .buttonStyle(.plain)
-        .help("Show in Finder")
-        .padding(4)
-        .glassPill()
+        // Confirm before editing the registry to uninstall the plugin.
+        .alert("Remove \u{201C}\(item.name)\u{201D}?", isPresented: $confirmingDelete) {
+            Button("Remove", role: .destructive) { performDelete() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This uninstalls the plugin from Claude Code (removes it from installed_plugins.json and enabledPlugins). Cached files are left in place.")
+        }
+    }
+
+    // Uninstall from the registry (safe JSON edits), then rescan so it disappears.
+    private func performDelete() {
+        let rawKey = item.id.hasPrefix("plugin:") ? String(item.id.dropFirst("plugin:".count)) : item.id
+        let name = item.name
+        guard ConfigScanner.deletePlugin(rawKey: rawKey) else {
+            model.showToast("Couldn't remove \u{201C}\(name)\u{201D}")
+            return
+        }
+        Task {
+            await model.config.load(roots: model.scanRoots)
+            model.recomputeStats()
+            model.showToast("Removed \u{201C}\(name)\u{201D}")
+        }
     }
 }
 

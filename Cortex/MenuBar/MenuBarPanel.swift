@@ -21,18 +21,24 @@ struct MenuBarPanel: View {
         VStack(alignment: .leading, spacing: 14) {
             header
 
-            // Running dynamic workflows - one row each (name + project + agents done/total) so
-            // two concurrent workflows are shown separately, not blended into one number.
-            if !model.workflows.workflows.isEmpty {
-                workflowSection
+            // Workflows whose project has NO active running session are shown standalone here;
+            // matched ones surface as an "N agents" chip UNDER their session row below, so the
+            // agent count lives with the session it belongs to.
+            let orphanWorkflows = model.workflows.workflows.filter { wf in
+                !model.activity.activeSessions.contains { $0.projectName == wf.project }
+            }
+            if !orphanWorkflows.isEmpty {
+                workflowSection(orphanWorkflows)
                 Divider().overlay(Theme.stroke)
             }
 
-            // What's running right now: a per-session breakdown when 2+ sessions are actually
-            // in a turn at once, otherwise the single live-activity row. Both reflect sessions
-            // that are working, not open-but-idle windows.
+            // What's running right now. Any session in a turn (even one) gets the detailed
+            // per-session breakdown - project + activity, with CLI / model / uptime / agents -
+            // so the richer detail shows without needing two concurrent sessions. The compact
+            // single row is kept only for the transient Done / Error flash after the last turn
+            // ends (no active sessions, but `current` is briefly non-idle).
             if model.menuBarLiveActivityEnabled {
-                if model.activity.activeSessions.count >= 2 {
+                if !model.activity.activeSessions.isEmpty {
                     runningSessionsSection
                     Divider().overlay(Theme.stroke)
                 } else if model.activity.current.isActive {
@@ -107,10 +113,12 @@ struct MenuBarPanel: View {
 
     // MARK: Workflow progress
 
-    /// One row per running dynamic workflow, so concurrent workflows stay distinct.
-    private var workflowSection: some View {
+    /// One row per running dynamic workflow (from the given subset), so concurrent workflows
+    /// stay distinct. Only workflows without a matching active session are passed here; matched
+    /// ones show as an "N agents" chip under their session row instead.
+    private func workflowSection(_ workflows: [WorkflowMonitor.RunningWorkflow]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(model.workflows.workflows) { workflowRow($0) }
+            ForEach(workflows) { workflowRow($0) }
         }
     }
 
@@ -170,23 +178,17 @@ struct MenuBarPanel: View {
                     .foregroundStyle(Theme.textTertiary)
             }
             ForEach(sessions) { session in
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(session.state == .awaitingPermission ? Color.yellow : Theme.green)
-                        .frame(width: 6, height: 6)
-                    Text(session.projectName)
-                        .font(.system(size: 13))
-                        .foregroundStyle(Theme.textPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer(minLength: 8)
-                    Text(session.label)
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
-                        .lineLimit(1)
-                }
+                RunningSessionRow(session: session, agents: agentCount(for: session))
             }
         }
+    }
+
+    /// Subagents currently in flight for a running session's project (0 when none), from the
+    /// live WorkflowMonitor, so each session row can show "N agents" while it's orchestrating.
+    private func agentCount(for session: ClaudeSessionActivity) -> Int {
+        model.workflows.workflows
+            .filter { $0.project == session.projectName }
+            .reduce(0) { $0 + max(0, $1.total - $1.done) }
     }
 
     // MARK: Live activity row
@@ -198,6 +200,7 @@ struct MenuBarPanel: View {
         case .idle: dotColor = Theme.textTertiary
         case .awaitingPermission: dotColor = .yellow
         case .done: dotColor = .green
+        case .error: dotColor = .red
         default: dotColor = Theme.green
         }
         return HStack(spacing: 8) {
@@ -310,6 +313,98 @@ struct MenuBarPanel: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
+    }
+}
+
+// MARK: - Running session row
+//
+// One session currently in a turn, shown under the menu bar's "Running" header. The top line
+// is the project + what it's doing (Thinking / Editing / …); the quiet second line carries the
+// at-a-glance detail: the surface it runs in (CLI or App, from the captured entrypoint), the
+// model when known, the live turn uptime, and the count of subagents in flight for that project.
+
+private struct RunningSessionRow: View {
+    let session: ClaudeSessionActivity
+    let agents: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Line 1: state dot + project, with the activity label RIGHT BESIDE the project
+            // name (not far-right) so it's easy to read which session is doing what when
+            // several run at once.
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(session.state == .awaitingPermission ? Color.yellow : Theme.green)
+                    .frame(width: 6, height: 6)
+                Text(session.projectName)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(session.label)
+                    .font(.caption)
+                    .foregroundStyle(session.state == .awaitingPermission ? Color.yellow : Theme.textSecondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+            }
+            // Line 2: quiet metadata - surface · model · uptime · agents. Each piece drops out
+            // when unknown, and a middot only appears between two present pieces.
+            HStack(spacing: 5) {
+                let client = clientLabel(session.client)
+                if let client {
+                    // Surface (CLI or App) from the captured entrypoint; omitted when unknown
+                    // so we never falsely label a non-terminal session "CLI".
+                    metaChip(icon: clientIcon(session.client), client)
+                }
+                if let model = session.model {
+                    if client != nil { metaDivider }
+                    metaChip(icon: nil, model)
+                }
+                if let start = session.startedAt {
+                    if client != nil || session.model != nil { metaDivider }
+                    // Live-tick the uptime once a second while the panel is open.
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        metaChip(icon: "clock", MenuBarController.elapsed(since: start))
+                    }
+                }
+                if agents > 0 {
+                    if client != nil || session.model != nil || session.startedAt != nil { metaDivider }
+                    metaChip(icon: "point.3.connected.trianglepath.dotted",
+                             "\(agents) agent\(agents == 1 ? "" : "s")")
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 14)   // align the meta line under the project name
+        }
+    }
+
+    /// Friendly surface label from the raw `CLAUDE_CODE_ENTRYPOINT`: "CLI" for the terminal,
+    /// "App" for any GUI surface. Returns nil when unknown so the row simply omits the chip
+    /// instead of asserting "CLI" for a non-terminal session.
+    private func clientLabel(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        return raw.lowercased() == "cli" ? "CLI" : "App"
+    }
+
+    /// Icon matching the surface: a terminal for CLI, a window for any GUI app.
+    private func clientIcon(_ raw: String?) -> String {
+        (raw ?? "").lowercased() == "cli" ? "terminal" : "macwindow"
+    }
+
+    private var metaDivider: some View {
+        Text("\u{00B7}").font(.system(size: 10)).foregroundStyle(Theme.textTertiary)
+    }
+
+    @ViewBuilder
+    private func metaChip(icon: String?, _ text: String) -> some View {
+        HStack(spacing: 3) {
+            if let icon {
+                Image(systemName: icon).font(.system(size: 9))
+            }
+            Text(text).font(.system(size: 10).monospacedDigit())
+        }
+        .foregroundStyle(Theme.textTertiary)
+        .lineLimit(1)
     }
 }
 

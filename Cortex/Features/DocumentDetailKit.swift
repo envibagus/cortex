@@ -62,6 +62,26 @@ enum ConfigFileOps {
     }
 }
 
+// MARK: - Memory file operations
+//
+// Trash / restore for a single memory .md file, mirroring ConfigFileOps so the Memory
+// detail's Delete reuses the same reversible-Trash pattern as skills / agents.
+
+enum MemoryFileOps {
+    /// Move a memory file to the Trash, returning its original path + Trash URL for undo.
+    @discardableResult
+    static func trash(_ path: String) throws -> (original: String, trashed: URL) {
+        var resulting: NSURL?
+        try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &resulting)
+        return (path, (resulting as URL?) ?? URL(fileURLWithPath: path))
+    }
+
+    /// Undo a `trash`: move the memory file back from the Trash to where it lived.
+    static func restore(from trashed: URL, to original: String) throws {
+        try FileManager.default.moveItem(at: trashed, to: URL(fileURLWithPath: original))
+    }
+}
+
 // MARK: - Arrow cursor over the editor
 
 extension View {

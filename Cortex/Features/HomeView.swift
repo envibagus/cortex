@@ -60,13 +60,16 @@ struct HomeView: View {
                         .transition(.opacity)
                 }
             }
-            .padding(.horizontal, 28)
+            .padding(.horizontal, Theme.pageHInset)
             .padding(.top, 0)
-            .padding(.bottom, 28)
+            .padding(.bottom, Theme.pageHInset)
             .frame(maxWidth: .infinity, alignment: .leading)
             .animation(.easeOut(duration: 0.35), value: model.isReady)
         }
         .background(Theme.canvas)
+        .cortexScrollEdge()
+        // Home intentionally has NO toolbar title: the "Good evening" greeting below is the
+        // page header, so a band title would just duplicate it. The band stays empty here.
         // Slow-load reassurance: a floating chip centered in the visible page (both
         // axes), shown only when the first load runs past 4s. Hidden the moment data is
         // ready. Sits on the ScrollView so it centers in the viewport, not in the
@@ -111,9 +114,13 @@ struct HomeView: View {
             // Greeting + its one-line fun-fact, kept tight together (small inner gap) so
             // the header reads as one block before the 24pt gap to the sections below.
             VStack(alignment: .leading, spacing: 6) {
-                // Contextual greeting (leading) + refresh (trailing). Smaller than a hero
-                // title; crossfades only when the time-of-day phrase turns over.
-                HStack(alignment: .center) {
+                // Contextual greeting (leading) + refresh (trailing). Home keeps NO toolbar
+                // title on purpose - this greeting is the page's header - so the refresh
+                // lives here beside it. Crossfades when the time-of-day phrase turns over.
+                // Top-aligned: the glass button is taller than the text line, and center
+                // alignment pushed the greeting down, inflating the gap under the title
+                // band; with .top the greeting hugs the page's first edge.
+                HStack(alignment: .top) {
                     Text(greeting)
                         .font(.title2.bold())
                         .foregroundStyle(.primary)
@@ -319,25 +326,77 @@ private struct HomeSkeleton: View {
 // so the pool is never empty. Key numbers are inlined as bold, tinted runs.
 
 private enum WelcomeText {
-    /// A contextual greeting derived from the time of day, e.g. "Good morning, NV" or
-    /// "The quiet hours, NV". Seeded by day-of-year + period so it stays put within a
-    /// period and only varies as the clock (and day) turns over.
+    /// A contextual greeting derived from the time of day, e.g. "Rise and shine!" or
+    /// "Where were we?". Mixes warm statements, real check-in questions, and the odd
+    /// exclamation so it reads like a person, not a label. Seeded by day-of-year + period
+    /// so it holds within a period and only varies as the clock (and day) turns over.
     static func greeting(name: String, date: Date) -> String {
         let cal = Calendar.current
         let hour = cal.component(.hour, from: date)
         let day = cal.ordinality(of: .day, in: .year, for: date) ?? 0
         let period: Int
-        let phrases: [String]
+        var phrases: [String]
+        let weekday = cal.component(.weekday, from: date)   // 1 = Sunday ... 7 = Saturday
+        // Phrases are templates: "%@" is the user's name; phrases WITHOUT it greet name-free
+        // (a plain hello or a persona like "night owl" / "early bird"). The punctuation mix is
+        // deliberate: some end in "!" for energy, some ask a "?" so it feels like a real
+        // check-in, and some stay calm - so the greeting reads like a person talking, not a
+        // label. Seeded by day + period so it holds within a period and rotates by day.
         switch hour {
-        case 5..<8:   period = 0; phrases = ["Early start", "Up with the sun", "Rise and shine"]
-        case 8..<12:  period = 1; phrases = ["Good morning", "Morning", "Fresh start"]
-        case 12..<14: period = 2; phrases = ["Midday check-in", "Good afternoon", "Lunch-hour look"]
-        case 14..<18: period = 3; phrases = ["Good afternoon", "Afternoon", "Back at it"]
-        case 18..<22: period = 4; phrases = ["Good evening", "Evening", "Winding down"]
-        default:      period = 5; phrases = ["The quiet hours", "It's late-night", "Burning the midnight oil"]
+        case 5..<8:
+            period = 0
+            phrases = ["Rise and shine, %@!", "Up with the sun, %@?", "Early start, %@",
+                       "Morning, early bird", "The day is yours, %@!",
+                       "Coffee first, %@?", "Fresh air, fresh code"]
+        case 8..<12:
+            period = 1
+            phrases = ["Good morning, %@!", "Ready to dive in, %@?", "Morning, %@",
+                       "What are we building today?", "Let's get into it!",
+                       "Let's make today count, %@!", "Fresh start, %@"]
+        case 12..<14:
+            period = 2
+            phrases = ["Good afternoon, %@!", "Afternoon already, %@?", "Midday check-in",
+                       "Halfway there, %@!", "Fed and focused, %@?", "Taking a breather?",
+                       "Back after lunch, %@"]
+        case 14..<18:
+            period = 3
+            phrases = ["Good afternoon, %@!", "Still going, %@?", "Back at it!",
+                       "Keep it rolling, %@!", "Second wind, %@?",
+                       "Deep-work hours", "Afternoon, %@"]
+        case 18..<22:
+            period = 4
+            phrases = ["Good evening, %@!", "Winding down, %@?", "Golden hour, %@",
+                       "Evening, night owl", "One more push, %@?",
+                       "Still going strong!", "Evening, %@"]
+        default:
+            period = 5
+            phrases = ["Still up, %@?", "The quiet hours", "Burning the midnight oil, %@?",
+                       "Hello, night owl", "Don't forget to rest, %@", "Late one tonight, %@?",
+                       "The witching hour"]
         }
-        let phrase = phrases[(day + period) % phrases.count]
-        return "\(phrase), \(name)"
+        // Blend in day-of-week soul: the Monday reset, the Friday wind-up, or a weekend that
+        // notices you're still here. These are time-neutral (they read fine at any hour) and
+        // are appended to the time-of-day pool, so a special day carries its own flavor
+        // without losing the ordinary options. Tuesday through Thursday add nothing.
+        switch weekday {
+        case 1, 7: // Sunday / Saturday
+            phrases += ["Weekend mode, %@", "Coding on a weekend, %@?", "No rush today, %@",
+                        "Weekend session?", "Even on a weekend, %@?"]
+        case 2: // Monday
+            phrases += ["New week, %@!", "Fresh week ahead?", "Monday reset, %@",
+                        "Let's start the week strong, %@!", "New week, new code"]
+        case 6: // Friday
+            phrases += ["Almost the weekend, %@!", "Friday, %@!", "Wrapping up the week?",
+                        "Finish strong, %@!", "Last push of the week?"]
+        default:
+            break
+        }
+        // With no name set, keep only the name-free phrases so there's never a dangling comma.
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        let nameFree = phrases.filter { !$0.contains("%@") }
+        let pool = trimmed.isEmpty ? (nameFree.isEmpty ? phrases : nameFree) : phrases
+        let template = pool[(day + period) % pool.count]
+        return template.contains("%@") ? String(format: template, trimmed) : template
     }
 
     /// The fun-fact pool, built from live data. Always includes the repos summary so it

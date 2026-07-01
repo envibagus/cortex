@@ -103,6 +103,9 @@ struct SessionsView: View {
             // session drills into it. The "Overview" button in the detail clears the
             // selection to return here.
             autoSelectFirst: false,
+            title: "Sessions",
+            subtitle: "Your Claude Code sessions, newest first",
+            count: filtered.count,
             emptyContent: { AnyView(SessionsDashboard()) }
         ) {
             SessionListHeader(
@@ -169,27 +172,15 @@ private struct SessionListHeader: View {
     @Binding var sort: SessionSort
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Standard big title + a plain gray count (no leading glyph).
-            HStack(spacing: 8) {
-                Text("Sessions")
-                    .font(.cortexTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 6)
-                Text("\(matchCount)")
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            // Search + project scope filter + sort (matches the library list panes).
-            LibraryFilterBar(
-                query: $query,
-                placeholder: "Search project or prompt",
-                scope: $scope,
-                scopes: scopes,
-                sort: $sort
-            )
-        }
+        // Title + count now live in the toolbar band (`.cortexPageChrome`); the left pane
+        // keeps just the shared search / scope / sort filter.
+        LibraryFilterBar(
+            query: $query,
+            placeholder: "Search project or prompt",
+            scope: $scope,
+            scopes: scopes,
+            sort: $sort
+        )
     }
 }
 
@@ -392,7 +383,7 @@ private struct SessionDetail: View {
                            help: "Tokens the model generated across the session.")
                 compactRow("Cache read", Fmt.grouped(session.usage.cacheRead),
                            help: "Cached context tokens reused across turns - much cheaper than fresh input.")
-                compactRow("Cache write", Fmt.grouped(session.usage.cacheWrite),
+                compactRow("Cache write", Fmt.grouped(session.usage.cacheWriteTotal),
                            help: "Tokens written into the prompt cache so later turns can reuse them.")
                 compactRow("Total", Fmt.grouped(session.usage.total), valueColor: Theme.purple, bold: true,
                            help: "Input + output + cache read + cache write.")

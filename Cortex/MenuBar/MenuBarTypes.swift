@@ -78,14 +78,13 @@ enum MenuBarTimeFormat: String, CaseIterable, Identifiable {
 
 /// How often the menu bar re-probes usage while the app is running.
 enum MenuBarRefreshInterval: Int, CaseIterable, Identifiable {
-    case m5 = 300, m15 = 900, m30 = 1800, h1 = 3600
+    case m5 = 300, m10 = 600, m15 = 900
     var id: Int { rawValue }
     var label: String {
         switch self {
         case .m5: "5 min"
+        case .m10: "10 min"
         case .m15: "15 min"
-        case .m30: "30 min"
-        case .h1: "1 hour"
         }
     }
 }

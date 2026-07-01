@@ -11,10 +11,35 @@ struct UsageView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        // The two toolbar buttons draw their OWN circular glass (square frame + glassPill).
+        // On macOS 26 the toolbar's shared system glass is suppressed per item, so they show
+        // as two separate CIRCLES instead of one wide shared oval. Pre-26 uses the plain
+        // toolbar (each control renders on its own).
+        Group {
+            if #available(macOS 26.0, *) {
+                scaffold.toolbar {
+                    ToolbarItem(placement: .primaryAction) { UsageOptionsMenu() }
+                        .sharedBackgroundVisibility(.hidden)
+                    ToolbarSpacer(.fixed)
+                    ToolbarItem(placement: .primaryAction) { RefreshControl() }
+                        .sharedBackgroundVisibility(.hidden)
+                }
+            } else {
+                scaffold.toolbar {
+                    ToolbarItem(placement: .primaryAction) { UsageOptionsMenu() }
+                    ToolbarItem(placement: .primaryAction) { RefreshControl() }
+                }
+            }
+        }
+        // Probe on first appearance (defers the one-time Keychain prompt until the
+        // user actually opens this page, not at app launch).
+        .task { await model.usage.load() }
+    }
+
+    private var scaffold: some View {
         PageScaffold(
             title: "Usage",
-            subtitle: "Live limits across your AI coding subscriptions",
-            toolbar: AnyView(HStack(spacing: 12) { UsageOptionsMenu(); RefreshControl() })
+            subtitle: "Live limits across your AI coding subscriptions"
         ) {
             // One card per provider.
             VStack(spacing: 16) {
@@ -32,9 +57,6 @@ struct UsageView: View {
                     .frame(maxWidth: .infinity, alignment: .center)
             }
         }
-        // Probe on first appearance (defers the one-time Keychain prompt until the
-        // user actually opens this page, not at app launch).
-        .task { await model.usage.load() }
     }
 }
 
@@ -47,16 +69,20 @@ private struct RefreshControl: View {
         Button {
             Task { await model.usage.refresh(); model.showToast("Refreshed") }
         } label: {
+            // Square frame + glassPill (a Capsule around a square) renders a CIRCLE, exactly
+            // like GlassRefreshButton. The toolbar's own system glass is suppressed above.
             Image(systemName: "arrow.clockwise")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.textSecondary)
                 .rotationEffect(.degrees(model.usage.isRefreshing ? 360 : 0))
                 .animation(model.usage.isRefreshing
                            ? .linear(duration: 0.9).repeatForever(autoreverses: false)
                            : .default, value: model.usage.isRefreshing)
+                .frame(width: 30, height: 30)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .linkCursor()
-        .foregroundStyle(Theme.textSecondary)
+        .glassPill()
         .help("Refresh usage")
         .disabled(model.usage.isRefreshing)
         .accessibilityIdentifier("usage-refresh")
@@ -87,12 +113,18 @@ private struct UsageOptionsMenu: View {
             }
         } label: {
             Image(systemName: "slider.horizontal.3")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(Theme.textSecondary)
+                .frame(width: 30, height: 30)
+                .contentShape(Circle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .fixedSize()
+        // Constrain the Menu itself (not just its label) to a square so glassPill's Capsule
+        // renders a CIRCLE. A Menu reserves extra width otherwise, which is why it stayed
+        // oval while the Button-based refresh control already went circular.
+        .frame(width: 30, height: 30)
+        .glassPill()
         .help("Usage display options")
         .accessibilityIdentifier("usage-options")
     }

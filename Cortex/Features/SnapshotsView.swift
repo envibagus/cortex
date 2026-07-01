@@ -43,7 +43,10 @@ struct SnapshotsView: View {
                 splitView
             }
         }
-        .navigationTitle("Snapshots")
+        .cortexScrollEdge()
+        .cortexPageChrome("Snapshots",
+                          subtitle: "Read-only versions of files Claude Code edited",
+                          count: store.didScan ? store.snapshotCount : nil)
         // Re-scan on first appear and whenever the session list is refreshed (so newly
         // backed-up files resolve to their real names once sessions finish loading).
         .task(id: model.sessions.lastScan) { await reload() }
@@ -65,19 +68,9 @@ struct SnapshotsView: View {
 
     // Left-pane header: title + overview counts + the shared search / scope / sort bar.
     private var listHeader: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Snapshots").font(.cortexTitle).foregroundStyle(Theme.textPrimary)
-                Spacer(minLength: 6)
-                Text(Fmt.grouped(store.snapshotCount))
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(Theme.textSecondary)
-            }
-            Text("\(store.files.count) \(store.files.count == 1 ? "file" : "files") across \(store.sessionCount) \(store.sessionCount == 1 ? "session" : "sessions")")
-                .font(.cortexCaption)
-                .foregroundStyle(Theme.textTertiary)
-            LibraryFilterBar(query: $query, placeholder: "Search files", scope: $scope, scopes: scopes, sort: $sort)
-        }
+        // Title + counts now live in the toolbar band (`.cortexPageChrome`); the left pane
+        // keeps just the shared search / scope / sort bar.
+        LibraryFilterBar(query: $query, placeholder: "Search files", scope: $scope, scopes: scopes, sort: $sort)
     }
 
     // MARK: - Derived list

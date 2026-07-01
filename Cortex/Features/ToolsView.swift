@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - ToolsView
 //
@@ -50,9 +51,16 @@ struct ToolsView: View {
         SplitDetailView(
             items: filteredServers,
             selectedID: $selectedID,
+            title: "MCP Servers",
+            subtitle: ConfigKind.mcp.blurb,
+            count: filteredServers.count,
             emptyIcon: "server.rack",
             emptyTitle: "No MCP server selected",
-            emptyMessage: "Pick a server on the left to see its transport, scope, tools, and connection details."
+            emptyMessage: "Pick a server on the left to see its transport, scope, and connection details.",
+            // ⌘C copies the server's launch command (stdio) or endpoint URL.
+            actions: { server in
+                PageActions(copyPath: { model.copyPath(server.command ?? server.url ?? "") })
+            }
         ) {
             // List header: page title + count, search + scope + sort filter
             ToolsListHeader(
@@ -65,6 +73,7 @@ struct ToolsView: View {
         } row: { server, _ in
             // PLAIN row content: the native List draws the system selection highlight
             MCPServerRow(server: server)
+                .contextMenu { AddToCollectionMenu(itemID: server.id) }
         } detail: { server in
             // Per-server connection detail rendered directly in the right pane
             MCPServerDetail(server: server)
@@ -82,7 +91,25 @@ struct ToolsView: View {
                 selectedID = filteredServers.first?.id
             }
         }
+        // Deep-link from the ⌘K palette: select the hinted MCP server on open / hint change.
+        .onAppear { applyServerHint() }
+        .onChange(of: model.librarySelectionHint) { _, _ in applyServerHint() }
         .background(Theme.canvas)
+    }
+
+    // Select the server named by model.librarySelectionHint (a ⌘K deep-link), if present.
+    private func applyServerHint() {
+        guard let hint = model.librarySelectionHint,
+              model.config.mcpServers.contains(where: { $0.id == hint }) else { return }
+        model.librarySelectionHint = nil
+        // If an active scope/search filter would hide the target, clear it so the deep-linked
+        // row is actually visible in the list (otherwise selectedID points at an off-list row
+        // and the split falls back to the first match / empty state).
+        if !filteredServers.contains(where: { $0.id == hint }) {
+            query = ""
+            scope = nil
+        }
+        selectedID = hint
     }
 }
 
@@ -100,21 +127,9 @@ private struct ToolsListHeader: View {
     @Binding var sort: LibrarySort
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Page title (smaller; name also shows in the toolbar) + MCP server count
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Tools")
-                    .font(.cortexTitle)
-                    .foregroundStyle(Theme.textPrimary)
-                Text("\(serverCount) \(serverCount == 1 ? "server" : "servers")")
-                    .font(.cortexCaption)
-                    .foregroundStyle(Theme.textTertiary)
-                Spacer(minLength: 0)
-            }
-
-            // Shared search + scope filter (Global / User / Project) + sort.
-            LibraryFilterBar(query: $query, placeholder: "Search MCP servers", scope: $scope, scopes: scopes, sort: $sort)
-        }
+        // Title + count + blurb now live in the toolbar band (`.cortexPageChrome`); the
+        // left pane keeps just the shared search / scope / sort filter.
+        LibraryFilterBar(query: $query, placeholder: "Search MCP servers", scope: $scope, scopes: scopes, sort: $sort)
     }
 }
 
@@ -209,20 +224,23 @@ private struct MCPServerRow: View {
 // The right-pane connection detail for one server, rebuilt with STOCK native
 // containers: a large native title (server name as .title.bold) with a transport
 // subtitle, then a "Connection" GroupBox of LabeledContent rows (transport, scope,
-// tools, needs auth), an endpoint GroupBox with the command / url in selectable
+// needs auth), an endpoint GroupBox with the command / url in selectable
 // monospaced text, a native auth-warning callout when needed, and an "About MCP"
 // GroupBox with a transport-aware explanation.
 
-private struct MCPServerDetail: View {
+struct MCPServerDetail: View {
     @Environment(AppModel.self) private var model
     let server: MCPServer
+
+    // Drives the native remove-confirmation alert (set by the Remove Server… menu item).
+    @State private var confirmingDelete = false
 
     // The connection tint, keyed to the server's transport
     private var tint: Color { MCPStyle.transportTint(server.transport) }
 
-    // Tool count phrasing: "n tools" when known, else "unknown"
-    private var toolCountText: String {
-        server.toolCount > 0 ? "\(server.toolCount) \(server.toolCount == 1 ? "tool" : "tools")" : "unknown"
+    // Name of the config file the server is defined in (for the delete confirmation copy).
+    private var configFileName: String {
+        (server.configPath as NSString?)?.lastPathComponent ?? "its config file"
     }
 
     // Command (stdio) vs URL (sse / http) shapes the endpoint section labels.
@@ -254,6 +272,28 @@ private struct MCPServerDetail: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.canvas)
+        // Confirm before editing the user's config file to remove the server.
+        .alert("Remove \u{201C}\(server.name)\u{201D}?", isPresented: $confirmingDelete) {
+            Button("Remove", role: .destructive) { performDelete() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This deletes the server from \(configFileName). The rest of the file is left unchanged.")
+        }
+    }
+
+    // Remove the server from its config JSON (safe round-trip), then rescan so it disappears.
+    private func performDelete() {
+        guard let path = server.configPath else { return }
+        let name = server.name
+        guard ConfigScanner.deleteMCPServer(name: name, scope: server.scope, configPath: path) else {
+            model.showToast("Couldn't remove \u{201C}\(name)\u{201D}")
+            return
+        }
+        Task {
+            await model.config.load(roots: model.scanRoots)
+            model.recomputeStats()
+            model.showToast("Removed \u{201C}\(name)\u{201D}")
+        }
     }
 
     // MARK: Header (large native title + transport subtitle)
@@ -272,8 +312,41 @@ private struct MCPServerDetail: View {
                         .foregroundStyle(Theme.warn)
                 }
                 Spacer(minLength: 0)
-                // Favorite toggle (favorited MCP servers appear on the Favorites page).
-                FavoriteToggle(id: server.id)
+                // Matches the Skills / Agents detail design language: ONE glass pill holding the
+                // favorite star + an ellipsis menu (add-to-collection and Show config in Finder).
+                LiquidGlassGroup(spacing: 8) {
+                    HStack(spacing: 2) {
+                        FavoriteToggle(id: server.id)
+
+                        Menu {
+                            AddToCollectionMenu(itemID: server.id)
+                            if let configPath = server.configPath {
+                                Divider()
+                                Button {
+                                    NSWorkspace.shared.selectFile(configPath, inFileViewerRootedAtPath: "")
+                                } label: {
+                                    Label("Show config in Finder", systemImage: "folder")
+                                }
+                                Divider()
+                                Button(role: .destructive) { confirmingDelete = true } label: {
+                                    Label("Remove Server\u{2026}", systemImage: "trash")
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 30, height: 26)
+                                .contentShape(Rectangle())
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("Server actions")
+                    }
+                    .padding(4)
+                    .glassPill()
+                }
             }
             Text("MCP server (\(server.transport.lowercased()))")
                 .font(.callout)
@@ -294,17 +367,6 @@ private struct MCPServerDetail: View {
                 }
 
                 LabeledContent("Scope", value: server.scope.capitalized)
-
-                LabeledContent("Tools") {
-                    // Tinted when the tool count is known, else native tertiary style.
-                    if server.toolCount > 0 {
-                        Text(toolCountText)
-                            .foregroundStyle(Theme.green)
-                    } else {
-                        Text(toolCountText)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
 
                 LabeledContent("Needs auth") {
                     Text(server.needsAuth ? "Yes" : "No")
@@ -400,11 +462,11 @@ private enum MCPStyle {
     static func note(for server: MCPServer) -> String {
         switch server.transport.lowercased() {
         case "stdio":
-            return "Connects over stdio: Claude Code launches the command above as a local subprocess and exchanges JSON-RPC over its standard streams. Tool count shows as unknown until the server has been started and its tools listed."
+            return "Connects over stdio: Claude Code launches the command above as a local subprocess and exchanges JSON-RPC over its standard streams."
         case "sse":
-            return "Connects over Server-Sent Events to the URL above. Tool count shows as unknown until the server has been reached and its tools listed."
+            return "Connects over Server-Sent Events to the URL above."
         default:
-            return "Connects over HTTP to the URL above. Tool count shows as unknown until the server has been reached and its tools listed."
+            return "Connects over HTTP to the URL above."
         }
     }
 }

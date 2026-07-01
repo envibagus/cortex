@@ -18,9 +18,15 @@ struct CortexApp: App {
     private var appearance: AppAppearance { AppAppearance(rawValue: appearanceRaw) ?? .dark }
 
     var body: some Scene {
-        // A single identified window so the menu bar can reopen it via openWindow after
-        // it's been closed to the menu bar (Cmd-W).
-        WindowGroup(id: "main") {
+        // A `Window` (NOT `WindowGroup`): this is a singleton scene, so there is only ever
+        // one main window. `openWindow(id: "main")` ORDERS THE EXISTING WINDOW TO THE FRONT
+        // (or recreates it if it was closed to the menu bar via Cmd-W) - it can never spawn a
+        // duplicate. A `WindowGroup` is a multi-window template: openWindow(id:) on a group
+        // always creates a NEW window, which produced double windows every time a reopen path
+        // (dock reopen / menu bar / revealMainWindow) fired against an already-open window.
+        // The title text is blanked by WindowConfigurator (titleVisibility=.hidden), so the
+        // "Cortex" here is only the accessibility / window-menu label.
+        Window("Cortex", id: "main") {
             ContentView()
                 .environment(model)
                 .frame(minWidth: 1040, minHeight: 680)
@@ -65,9 +71,13 @@ struct CortexApp: App {
                 Button("New Item") { model.newItemForCurrentRoute() }
                     .keyboardShortcut("n", modifiers: .command)
             }
-            // ⌘\ toggles the sidebar, beside the system sidebar commands.
+            // ⌘B toggles the sidebar, beside the system sidebar commands. ⌘\ is kept as a
+            // second binding for muscle memory (a menu item shows only one shortcut, so the
+            // extra button carries the alternate key without a confusing duplicate label).
             CommandGroup(after: .sidebar) {
                 Button("Toggle Sidebar") { model.toggleSidebar() }
+                    .keyboardShortcut("b", modifiers: .command)
+                Button("Toggle Sidebar (\\)") { model.toggleSidebar() }
                     .keyboardShortcut("\\", modifiers: .command)
             }
             // ⌘K palette, ⌘F focus search, ⌘R refresh all, ⌘⇧R rescan the current page.
@@ -129,6 +139,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    /// Closing the last window (Cmd-W) must NOT quit Cortex: it lives on in the menu bar
+    /// with no window open. A single `Window` scene otherwise terminates the app when its
+    /// only window closes, which made a plain Cmd-W surface the Cmd-Q quit prompt (and
+    /// "Keep in Menu Bar" - which closes the window - re-fire it in a loop). Returning
+    /// false closes the window (freeing heavy data via its onDisappear) and leaves the
+    /// process + menu bar running; the window reopens on demand via openWindow(id:"main").
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Don't prompt if there's no menu bar to keep (e.g. it's been turned off).
         guard AppModel.current?.showMenuBarItem == true else { return .terminateNow }
@@ -136,17 +156,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Quit Cortex?"
         alert.informativeText = "Quit completely, or keep Cortex running in the menu bar?"
-        alert.addButton(withTitle: "Quit")             // .alertFirstButtonReturn
-        alert.addButton(withTitle: "Keep in Menu Bar") // .alertSecondButtonReturn
+        // "Keep in Menu Bar" is the DEFAULT (prominent) button - keeping Cortex around is the
+        // safer, more common choice; fully quitting is the deliberate one.
+        alert.addButton(withTitle: "Keep in Menu Bar") // .alertFirstButtonReturn (default)
+        alert.addButton(withTitle: "Quit")             // .alertSecondButtonReturn
         alert.addButton(withTitle: "Cancel")           // .alertThirdButtonReturn
 
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            return .terminateNow
-        case .alertSecondButtonReturn:
-            // Close the window (frees the heavy data); keep the process + menu bar alive.
+            // Keep: close the window (frees the heavy data); keep the process + menu bar alive.
             NSApp.windows.filter { $0.styleMask.contains(.titled) }.forEach { $0.close() }
             return .terminateCancel
+        case .alertSecondButtonReturn:
+            return .terminateNow
         default:
             return .terminateCancel
         }

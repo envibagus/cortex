@@ -132,6 +132,9 @@ struct FavoritesView: View {
         SplitDetailView(
             items: filtered,
             selectedID: $selectedID,
+            title: "Favorites",
+            subtitle: "Everything you've starred",
+            count: filtered.count,
             emptyIcon: "star",
             emptyTitle: "No item selected",
             emptyMessage: "Select a favorite on the left to see its contents."
@@ -244,18 +247,9 @@ private struct FavoritesListHeader: View {
     let kinds: [ConfigKind]
 
     var body: some View {
+        // Title + count now live in the toolbar band (`.cortexPageChrome`); the left pane
+        // keeps the search field + kind chip row.
         VStack(alignment: .leading, spacing: 12) {
-            // Title row: standard big title + a plain gray count (no leading glyph).
-            HStack(spacing: 8) {
-                Text("Favorites")
-                    .font(.cortexTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 6)
-                Text("\(count)")
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
             // Inline search field filtering by name/detail
             FavoritesSearchField(query: $query, placeholder: "Search favorites")
 

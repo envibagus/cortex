@@ -25,24 +25,14 @@ struct DiffsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Title + tab switch, pinned (left-aligned) above whichever tab is showing.
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Diffs")
-                        .font(.largeTitle.bold())
-                        .foregroundStyle(.primary)
-                    Text(mode == .workingTree
-                         ? "Uncommitted changes across your repos"
-                         : "Files Claude Code changed, grouped by session")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                GlassSegmentedControl(items: Mode.allCases, selection: $mode) { $0.rawValue }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 28)
-            .padding(.top, 22)
-            .padding(.bottom, 14)
+            // Tab switch, pinned (left-aligned) above whichever tab is showing. The title +
+            // subtitle now live in the toolbar band (`.cortexPageChrome`), so only the
+            // Working Tree / By Session control sits here.
+            GlassSegmentedControl(items: Mode.allCases, selection: $mode) { $0.rawValue }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, Theme.pageHInset)
+                .padding(.top, Theme.pageTopInset)
+                .padding(.bottom, 14)
 
             Divider().overlay(Theme.stroke)
 
@@ -52,7 +42,10 @@ struct DiffsView: View {
             }
         }
         .background(Theme.canvas)
-        .navigationTitle("Diffs")
+        .cortexScrollEdge()
+        .cortexPageChrome("Diffs", subtitle: mode == .workingTree
+                          ? "Uncommitted changes across your repos"
+                          : "Files Claude Code changed, grouped by session")
     }
 }
 
@@ -421,9 +414,6 @@ private struct RepoChangesPane: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text(repo.name).font(.largeTitle.bold()).foregroundStyle(.primary).lineLimit(1)
-                if let branch = repo.currentBranch, !branch.isEmpty {
-                    Pill(text: branch, tint: Theme.green)
-                }
                 Spacer(minLength: 8)
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: repo.path)])
@@ -434,6 +424,14 @@ private struct RepoChangesPane: View {
                 .foregroundStyle(Theme.blue)
                 .linkCursor()
                 .help("Reveal the repo in Finder")
+            }
+            // Branch pill on its own line below the title (mirroring the left list's
+            // name-over-branch rows): inline next to the title, a long branch name
+            // squeezed the repo name into truncation.
+            if let branch = repo.currentBranch, !branch.isEmpty {
+                Pill(text: branch, tint: Theme.green)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Text(repo.path.tildeAbbreviated)
                 .font(.callout.monospaced())

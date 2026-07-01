@@ -40,6 +40,10 @@ struct ReposView: View {
             activeSplit
         }
         .background(Theme.canvas)
+        .cortexScrollEdge()
+        .cortexPageChrome("Repos",
+                          subtitle: "Local working trees and your GitHub repositories",
+                          count: activeCount)
         // Deep-link from the Home "By project" tables: select the hinted repo.
         .onAppear {
             applyRepoHint()
@@ -98,17 +102,9 @@ struct ReposView: View {
     // MARK: Top bar (full-width title + metrics strip + tabs)
 
     private var topBar: some View {
+        // Title + count live in the toolbar band (`.cortexPageChrome`); the top bar keeps
+        // the working-tree metrics strip and the All / Local / GitHub tabs.
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Repos")
-                    .font(.cortexTitle)
-                    .foregroundStyle(Theme.textPrimary)
-                Text("\(activeCount)")
-                    .font(.cortexCaption)
-                    .foregroundStyle(Theme.textTertiary)
-                Spacer(minLength: 0)
-            }
-
             // Working-tree health across your LOCAL repos, using the shared StatTile.
             // (Dirty / Behind / Ahead / CLAUDE.md / skills are all local-clone properties,
             // so the leading count is the local-repo count, not the merged All-tab total.)
@@ -133,8 +129,8 @@ struct ReposView: View {
                     firstLoad = false
                 }
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 16)
+        .padding(.horizontal, Theme.pageHInset)
+        .padding(.top, Theme.pageTopInset)
         .padding(.bottom, 12)
     }
 

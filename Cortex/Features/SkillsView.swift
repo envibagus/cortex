@@ -48,6 +48,8 @@ struct ConfigBrowser: View {
     @State private var query = ""
     // Scope filter (nil = all): "Global" or a project name.
     @State private var scope: String?
+    // Origin filter (nil = all): "Mine", "Any plugin", or a specific plugin name.
+    @State private var origin: String?
     // The id of the row whose detail is shown in the right pane (nil == none)
     @State private var selectedID: ConfigItem.ID?
 
@@ -65,6 +67,29 @@ struct ConfigBrowser: View {
         return (set.contains("Global") ? ["Global"] : []) + others
     }
 
+    // Distinct provenance filters, only when plugin items are present: "Mine" (when any
+    // authored-locally items exist), "Any plugin", then each plugin by name (A-Z). Empty
+    // for kinds that never come from plugins (Agents/Commands/Rules), which hides the pill.
+    private var origins: [String] {
+        let pluginNames = Set(items.compactMap(\.pluginName))
+        guard !pluginNames.isEmpty else { return [] }
+        var out: [String] = []
+        if items.contains(where: { $0.pluginName == nil }) { out.append(OriginFilter.mine) }
+        out.append(OriginFilter.anyPlugin)
+        out += pluginNames.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return out
+    }
+
+    // Whether an item passes the current origin filter (nil == all origins).
+    private func matchesOrigin(_ item: ConfigItem) -> Bool {
+        guard let origin else { return true }
+        switch origin {
+        case OriginFilter.mine: return item.pluginName == nil
+        case OriginFilter.anyPlugin: return item.pluginName != nil
+        default: return item.pluginName == origin
+        }
+    }
+
     // Items filtered by the live query (name + detail) AND the selected scope, then
     // ordered by the app-wide library sort. A freshly created item
     // (model.recentlyCreatedID) is floated to the FRONT - AFTER sorting - so it shows
@@ -73,6 +98,7 @@ struct ConfigBrowser: View {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let matches = items.filter { item in
             (scope == nil || item.scopeLabel == scope)
+                && matchesOrigin(item)
                 && (trimmed.isEmpty
                     || item.name.localizedCaseInsensitiveContains(trimmed)
                     || item.detail.localizedCaseInsensitiveContains(trimmed))
@@ -95,9 +121,21 @@ struct ConfigBrowser: View {
         SplitDetailView(
             items: filtered,
             selectedID: $selectedID,
+            title: kind.plural,
+            subtitle: kind.blurb,
+            count: filtered.count,
             emptyIcon: kind.icon,
             emptyTitle: "No \(kind.singular.lowercased()) selected",
-            emptyMessage: "Select a \(kind.singular.lowercased()) on the left to see its dashboard."
+            emptyMessage: "Select a \(kind.singular.lowercased()) on the left to see its dashboard.",
+            // ⌘E opens the editor, ⌘C copies the path, ⌫ raises the delete confirmation
+            // (via pendingDeleteItemID, which ConfigItemDetail watches).
+            actions: { item in
+                PageActions(
+                    edit: { model.editingItemID = item.id },
+                    copyPath: { model.copyPath(item.path) },
+                    delete: { model.pendingDeleteItemID = item.id }
+                )
+            }
         ) {
             // Left-pane header: page title + live count + search + scope + sort filter
             ConfigListHeader(
@@ -106,6 +144,8 @@ struct ConfigBrowser: View {
                 query: $query,
                 scope: $scope,
                 scopes: scopes,
+                origin: $origin,
+                origins: origins,
                 sort: sortBinding
             )
         } row: { item, _ in
@@ -134,6 +174,12 @@ struct ConfigBrowser: View {
                 selectedID = filtered.first?.id
             }
         }
+        // Same fallback when the origin filter hides the current selection.
+        .onChange(of: origin) { _, _ in
+            if let id = selectedID, !filtered.contains(where: { $0.id == id }) {
+                selectedID = filtered.first?.id
+            }
+        }
         // A freshly created item (in THIS browser's list) becomes the selection so its
         // detail mounts and ConfigItemDetail can auto-open the editor. Guard on the id
         // belonging here so the other browsers (a different kind) ignore it.
@@ -149,6 +195,15 @@ struct ConfigBrowser: View {
                 model.recentlyCreatedID = nil
             }
         }
+        // Deep-link from the ⌘K palette: select the hinted item when this page opens (or when
+        // the hint changes while already open), then clear the hint. Only the browser whose
+        // items include the id acts, so a skill hint never disturbs the Agents list.
+        .onAppear { applyLibraryHint() }
+        .onChange(of: model.librarySelectionHint) { _, _ in applyLibraryHint() }
+        // If the deep-link arrives before config has loaded these items, the onAppear check
+        // finds nothing and leaves the hint set; re-try when the items populate so it isn't
+        // stranded (the hint clears itself once consumed, so this is a no-op afterward).
+        .onChange(of: items.map(\.id)) { _, _ in applyLibraryHint() }
         // Single native alert with a TextField + Create button, reached from any menu.
         .alert("New Collection", isPresented: $showNewCollectionAlert) {
             TextField("Collection name", text: $newCollectionName)
@@ -160,6 +215,23 @@ struct ConfigBrowser: View {
         } message: {
             Text("Name your new collection.")
         }
+    }
+
+    // Select the item named by model.librarySelectionHint (a ⌘K deep-link), if it belongs to
+    // this browser's kind. Clears the hint so it fires once.
+    private func applyLibraryHint() {
+        guard let hint = model.librarySelectionHint,
+              items.contains(where: { $0.id == hint }) else { return }
+        model.librarySelectionHint = nil
+        // If an active scope/search/origin filter would hide the target, clear it so the
+        // deep-linked row is actually visible (otherwise selectedID points at an off-list row
+        // and the split falls back to the first match / empty state).
+        if !filtered.contains(where: { $0.id == hint }) {
+            query = ""
+            scope = nil
+            origin = nil
+        }
+        selectedID = hint
     }
 
     // Open the new-collection alert, remembering which item should join it.
@@ -300,31 +372,22 @@ private struct ConfigListHeader: View {
     @Binding var query: String
     @Binding var scope: String?
     let scopes: [String]
+    @Binding var origin: String?
+    let origins: [String]
     @Binding var sort: LibrarySort
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Title row: smaller page title (the page name also shows in the toolbar) +
-            // a plain gray count, no leading kind glyph.
-            HStack(spacing: 8) {
-                Text(kind.plural)
-                    .font(.cortexTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 6)
-                Text("\(count)")
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            // Search + scope filter (Global / each project) + sort.
-            LibraryFilterBar(
-                query: $query,
-                placeholder: "Search \(kind.plural.lowercased())",
-                scope: $scope,
-                scopes: scopes,
-                sort: $sort
-            )
-        }
+        // Title + count + blurb now live in the toolbar band (`.cortexPageChrome`); the
+        // left pane keeps just the shared search / scope / origin / sort filter.
+        LibraryFilterBar(
+            query: $query,
+            placeholder: "Search \(kind.plural.lowercased())",
+            scope: $scope,
+            scopes: scopes,
+            sort: $sort,
+            origin: $origin,
+            origins: origins
+        )
     }
 }
 
@@ -426,10 +489,14 @@ private struct ConfigItemRow: View {
         // gets a yellow rounded stroke (distinct from the blue system selection), so
         // it's obvious which item the editor is bound to.
         .padding(.horizontal, 4)
+        // Yellow edit ring: trace the SAME rounded rect as the blue system selection rather
+        // than sitting inset within it. The overlay negates the row's 4pt inset and uses the
+        // native selection radius (~8pt) so the ring lines up with the selection edge.
         .overlay {
             if model.editingItemID == item.id {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .strokeBorder(Color.yellow, lineWidth: 1.5)
+                    .padding(.horizontal, -4)
             }
         }
     }
@@ -452,7 +519,7 @@ private func outlineSymbol(_ name: String) -> String {
 // the rendered markdown OR raw source, with a native GroupBox of LabeledContent
 // metadata rows). Re-identified by item id so the scroll + toggle reset on change.
 
-private struct ConfigItemDetail: View {
+struct ConfigItemDetail: View {
     @Environment(AppModel.self) private var model
     let item: ConfigItem
     let tint: Color
@@ -543,6 +610,14 @@ private struct ConfigItemDetail: View {
         // yellow border / editor state never lingers on the previous item.
         .onDisappear {
             if model.editingItemID == item.id { model.editingItemID = nil }
+        }
+        // A keyboard ⌫ on this item (from the focused list) requests deletion by id; raise
+        // the same native confirmation the ellipsis-menu Delete uses, then clear the flag.
+        .onChange(of: model.pendingDeleteItemID) { _, new in
+            if new == item.id {
+                confirmingDelete = true
+                model.pendingDeleteItemID = nil
+            }
         }
         // Native macOS warning before a destructive delete. Confirming moves the item to
         // the Trash and shows an Undo toast (see performDelete).
@@ -676,6 +751,10 @@ struct NativeDocumentDetail: View {
 
     // Drives the inline-title reveal: true once the large title has scrolled away.
     @State private var scrolledPastTitle = false
+    // Gates the heavy markdown body: false until a short beat after the content settles, so
+    // holding ↑/↓ never builds documents the user is only scrubbing past. Keyed on content
+    // (see .task below) so it works whether or not the pane is re-identified per item.
+    @State private var bodyReady = false
     // Focuses the editor's text the moment edit mode opens (so a freshly created item
     // lands with the cursor already in the canvas).
     @FocusState private var editorFocused: Bool
@@ -706,6 +785,17 @@ struct NativeDocumentDetail: View {
             if let topTrailing {
                 documentTopBar(accessory: topTrailing)
             }
+        }
+        // Defer the heavy markdown build a short beat after the content settles. Keying on
+        // content restarts (and cancels) the timer on every selection, so scrubbing through
+        // the list with ↑/↓ never pays a full parse + highlight for items passed over; a
+        // settled selection renders as soon as the beat elapses. The header + metadata are
+        // outside this gate, so the pane always updates instantly.
+        .task(id: content) {
+            bodyReady = false
+            try? await Task.sleep(for: .milliseconds(90))
+            guard !Task.isCancelled else { return }
+            bodyReady = true
         }
     }
 
@@ -752,15 +842,31 @@ struct NativeDocumentDetail: View {
             Spacer(minLength: 8)
             accessory
         }
-        .padding(.leading, 24)
+        .padding(.leading, Theme.pageHInset)
         .padding(.trailing, 14)
-        .padding(.vertical, 10)
+        // Hug the top-right corner: minimal top gap so the action cluster sits right at the
+        // top of the detail pane rather than floating below an empty band.
+        .padding(.top, 6)
+        .padding(.bottom, 10)
         .background {
             if revealed { Rectangle().fill(.bar).ignoresSafeArea() }
         }
         .overlay(alignment: .bottom) {
             if revealed { Divider().overlay(Theme.stroke) }
         }
+    }
+
+    // A light skeleton shown in place of the markdown body while it's deferred, matching
+    // the app's loading language so a scrubbed-past selection reads as "loading" rather
+    // than frozen. The title / subtitle / metadata around it are already on screen.
+    private var markdownPlaceholder: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SkeletonBlock(width: 240, height: 15, cornerRadius: 5)
+            SkeletonBlock(height: 12, cornerRadius: 4)
+            SkeletonBlock(height: 12, cornerRadius: 4)
+            SkeletonBlock(width: 300, height: 12, cornerRadius: 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var scrollBody: some View {
@@ -795,10 +901,17 @@ struct NativeDocumentDetail: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 4)
-                } else {
-                    // Rendered markdown preview (already system typography).
+                } else if bodyReady {
+                    // Rendered markdown preview (already system typography). Built only once
+                    // the selection settles (see the .task above) so fast keyboard scrubbing
+                    // stays smooth.
                     MarkdownText(markdown: content)
                         .padding(.top, 4)
+                } else {
+                    // Brief placeholder while the body is deferred (a beat, or the whole time
+                    // the user keeps scrubbing). The title/subtitle above are already shown.
+                    markdownPlaceholder
+                        .padding(.top, 8)
                 }
 
                 // Native metadata: a GroupBox of LabeledContent key/value rows.
@@ -825,11 +938,14 @@ struct NativeDocumentDetail: View {
             }
             // Tighter top so the document title rides up level with the floating action
             // controls instead of leaving an empty band above it.
-            .padding(.horizontal, 24)
+            .padding(.horizontal, Theme.pageHInset)
             .padding(.bottom, 24)
             .padding(.top, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // macOS 26 soft blur as the document scrolls under the floating action bar, instead
+        // of the content sliding under a plain edge.
+        .cortexScrollEdge()
     }
 }
 
@@ -1085,10 +1201,14 @@ struct NewItemMenu: View {
                 }
             }
             Divider()
-            // Collections are a library construct (not a file), so create + navigate.
+            // Collections are a library construct (not a file): navigate to the Collections
+            // page and open its "New Collection" name modal (don't silently auto-create).
             Button {
-                _ = model.library.createCollection(name: "New Collection")
                 model.route = .collections
+                // Let the page mount + its listener attach before requesting the modal.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    NotificationCenter.default.post(name: .cortexNewCollectionRequested, object: nil)
+                }
             } label: {
                 Label("New Collection", systemImage: "rectangle.stack.badge.plus")
             }

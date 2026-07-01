@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import AVFoundation
 
 // MARK: - ActivityService
 //
@@ -22,7 +23,11 @@ import AppKit
 /// What Claude Code is doing right now. `idle` means there is no active turn; `done` is a
 /// brief, attention-grabbing flash shown right after a turn finishes.
 enum ClaudeActivityState: String, Sendable {
-    case idle, thinking, tool, awaitingPermission, done
+    // `done` = a turn that finished cleanly; `error` = a turn that ended on an API error
+    // (Claude Code logged an `isApiErrorMessage` entry). Both are brief end-of-turn flashes,
+    // but `error` reads red and never chimes/celebrates, so a failed turn isn't shown as a
+    // green "Done".
+    case idle, thinking, tool, awaitingPermission, done, error
 }
 
 /// A snapshot of the current activity, derived from the latest hook event.
@@ -51,6 +56,15 @@ struct ClaudeSessionActivity: Sendable, Identifiable, Equatable {
     var tool: String?
     var cwd: String?
     var updatedAt: Date
+    /// When this session's current turn began (drives the menu-bar uptime); nil if unknown.
+    var startedAt: Date?
+    /// Pretty model name for the current turn (e.g. "Opus 4.8"), resolved once from the
+    /// transcript tail so the menu bar can show it without loading the heavy SessionStore.
+    var model: String?
+    /// Which Claude Code surface this session runs in (raw `CLAUDE_CODE_ENTRYPOINT`: the terminal
+    /// vs a GUI app), used to label CLI vs app. nil if the hook didn't capture one (older
+    /// installs, or the surface doesn't export it).
+    var client: String?
     /// Last path component of the working directory, or "session" when unknown.
     var projectName: String { cwd.map { ($0 as NSString).lastPathComponent } ?? "session" }
 }
@@ -80,6 +94,7 @@ enum ActivityLabels {
         case .idle, .thinking: return "sparkle"
         case .awaitingPermission: return "exclamationmark.circle"
         case .done: return "checkmark.circle.fill"
+        case .error: return "exclamationmark.triangle.fill"
         case .tool:
             switch tool {
             case "Read", "Glob", "Grep": return "magnifyingglass"
@@ -109,12 +124,23 @@ final class ActivityService {
 
     // Mirrored in from AppModel when the user changes them.
     var completionSoundEnabled = false
-    var completionThreshold: TimeInterval = 60
+    var completionSoundName = "hero-complete-soft"
+    // Skip only trivial instant turns (a quick read, a one-line answer); any real turn chimes.
+    var completionThreshold: TimeInterval = 10
+    // Retains the AVAudioPlayer while a completion chime plays (a player deallocates - and
+    // goes silent - the moment it's released). Kept preloaded across completions and only
+    // rebuilt when the chosen sound changes, so playback is a rewind + play, not a
+    // create-decode-play in a single tick (which can occasionally race and stay silent).
+    private var completionPlayer: AVAudioPlayer?
+    private var loadedSoundName: String?
 
     private var pollTask: Task<Void, Never>?
     // Per-session turn-start times (drives the elapsed timer + the completion-chime
     // threshold), keyed by Claude session id; pruned when a session's file disappears.
     private var sessionTurnStart: [String: Date] = [:]
+    // Per-session pretty model name, resolved once from the transcript tail at turn start, so
+    // the menu bar can show which model each running session uses (no heavy SessionStore).
+    private var sessionModel: [String: String] = [:]
     // Whether the previous poll had at least one running session, so the transition to zero
     // can flash "Done" (+ confetti) exactly once.
     private var hadActive = false
@@ -228,10 +254,10 @@ final class ActivityService {
             hadActive = false
             // Celebrate only when a turn actually ended (a Stop/idle event), not when the last
             // session was merely pruned for staleness (crashed / left mid-permission-prompt).
-            if scan.endedNormally { finishTurnFlash(now: now) }
+            if scan.endedNormally { finishTurnFlash(now: now, errored: scan.endedWithError) }
             else if current != .idle { current = .idle }
             oldestActiveStart = nil
-        } else if current.state != .done, current != .idle {
+        } else if current.state != .done, current.state != .error, current != .idle {
             current = .idle
         }
     }
@@ -241,13 +267,14 @@ final class ActivityService {
     /// self-cleans. `endedNormally` is true when at least one tracked session ended via a real
     /// terminal event this tick (vs only staleness), so the caller flashes "Done" only for
     /// genuine completions. Also maintains per-session turn starts.
-    private func scanActiveSessions(now: Date) -> (sessions: [ClaudeSessionActivity], endedNormally: Bool) {
+    private func scanActiveSessions(now: Date) -> (sessions: [ClaudeSessionActivity], endedNormally: Bool, endedWithError: Bool) {
         let dir = dirURL.appendingPathComponent("sessions")
         let fm = FileManager.default
         let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         var out: [ClaudeSessionActivity] = []
         var liveIDs = Set<String>()
         var endedNormally = false
+        var endedWithError = false
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
@@ -256,6 +283,8 @@ final class ActivityService {
             let tool = nonEmpty(obj["tool"])
             let cwd = nonEmpty(obj["cwd"])
             let note = nonEmpty(obj["note"]) ?? ""
+            let transcript = nonEmpty(obj["transcript"])
+            let client = nonEmpty(obj["client"])
             let ts = (obj["ts"] as? NSNumber)?.doubleValue ?? Double((obj["ts"] as? String) ?? "") ?? 0
             let eventDate = ts > 0 ? Date(timeIntervalSince1970: ts) : .distantPast
 
@@ -263,8 +292,17 @@ final class ActivityService {
             // A real terminal event (Stop / SessionEnd / idle notification): turn finished.
             if state == .idle {
                 try? fm.removeItem(at: file)
-                if sessionTurnStart[sid] != nil { endedNormally = true }
+                if sessionTurnStart[sid] != nil {
+                    endedNormally = true
+                    // Distinguish a clean finish from an API error: Claude Code records the
+                    // latter as an assistant entry flagged `isApiErrorMessage`, so a turn that
+                    // "finished" on an error surfaces as .error (red), not a green Done.
+                    if let transcript, Self.transcriptEndedInError(path: transcript) {
+                        endedWithError = true
+                    }
+                }
                 sessionTurnStart[sid] = nil
+                sessionModel[sid] = nil
                 continue
             }
             // Crashed / abandoned (incl. a long-unanswered permission prompt): drop after
@@ -272,15 +310,25 @@ final class ActivityService {
             if now.timeIntervalSince(eventDate) > 1800 {
                 try? fm.removeItem(at: file)
                 sessionTurnStart[sid] = nil
+                sessionModel[sid] = nil
                 continue
             }
-            if sessionTurnStart[sid] == nil { sessionTurnStart[sid] = eventDate }
+            // First event of a turn: stamp its start and resolve the model once from the
+            // transcript tail (reused for the rest of the turn, so the poll stays cheap).
+            if sessionTurnStart[sid] == nil {
+                sessionTurnStart[sid] = eventDate
+                if let transcript { sessionModel[sid] = Self.transcriptModel(path: transcript) }
+            }
             liveIDs.insert(sid)
             out.append(ClaudeSessionActivity(session: sid, state: state, label: label,
-                                             tool: tool, cwd: cwd, updatedAt: eventDate))
+                                             tool: tool, cwd: cwd, updatedAt: eventDate,
+                                             startedAt: sessionTurnStart[sid],
+                                             model: sessionModel[sid],
+                                             client: client))
         }
         sessionTurnStart = sessionTurnStart.filter { liveIDs.contains($0.key) }
-        return (out.sorted { $0.updatedAt > $1.updatedAt }, endedNormally)
+        sessionModel = sessionModel.filter { liveIDs.contains($0.key) }
+        return (out.sorted { $0.updatedAt > $1.updatedAt }, endedNormally, endedWithError)
     }
 
     /// Map a raw hook event to a state + label. `.idle` means "not in a turn".
@@ -302,19 +350,103 @@ final class ActivityService {
 
     /// Chime if the longest just-finished turn ran long enough, then flash "Done" (the confetti
     /// + green label are driven off `current.state == .done`) for a few seconds before idle.
-    private func finishTurnFlash(now: Date) {
-        if completionSoundEnabled, let start = oldestActiveStart,
+    private func finishTurnFlash(now: Date, errored: Bool) {
+        // A clean finish may chime; an errored turn never does (it isn't a "success").
+        if !errored, completionSoundEnabled, let start = oldestActiveStart,
            now.timeIntervalSince(start) >= completionThreshold {
-            NSSound(named: NSSound.Name("Glass"))?.play()
+            playCompletionSound()
         }
         doneClearTask?.cancel()
-        current = ClaudeActivity(state: .done, label: "Done", tool: nil,
+        current = ClaudeActivity(state: errored ? .error : .done,
+                                 label: errored ? "Error" : "Done", tool: nil,
                                  session: current.session, cwd: current.cwd, turnStartedAt: nil)
+        // Hold the error flash a touch longer so a failed turn is actually noticed.
+        let hold = errored ? 6.0 : 4.0
         doneClearTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(4))
-            guard !Task.isCancelled, self?.current.state == .done else { return }
+            try? await Task.sleep(for: .seconds(hold))
+            guard !Task.isCancelled,
+                  self?.current.state == .done || self?.current.state == .error else { return }
             self?.current = .idle
         }
+    }
+
+    /// Play the chosen completion chime from the bundled `.caf`. Preloaded + retained for the
+    /// duration of playback. Falls back to the default pack, then the system "Glass" sound, if
+    /// the asset is missing, so a bad name never leaves the completion silent.
+    private func playCompletionSound() {
+        // (Re)load only when the chosen sound changed - otherwise reuse the preloaded player.
+        if completionPlayer == nil || loadedSoundName != completionSoundName {
+            let url = Bundle.main.url(forResource: completionSoundName, withExtension: "caf")
+                ?? Bundle.main.url(forResource: "hero-complete-soft", withExtension: "caf")
+            guard let url, let player = try? AVAudioPlayer(contentsOf: url) else {
+                NSSound(named: NSSound.Name("Glass"))?.play()
+                return
+            }
+            player.prepareToPlay()
+            completionPlayer = player
+            loadedSoundName = completionSoundName
+        }
+        // Rewind so a rapid second completion re-triggers instead of being ignored mid-play.
+        completionPlayer?.currentTime = 0
+        completionPlayer?.play()
+    }
+
+    // MARK: Transcript tail (model + error classification)
+    //
+    // Claude Code records each turn to a JSONL transcript. The last `assistant` entry tells us
+    // two things the lightweight per-session hook files can't: which model is running, and
+    // whether the turn ended on an API error (flagged `isApiErrorMessage`). We read only the
+    // file's tail so a huge transcript never stalls the 500ms poll, and only at turn start
+    // (model) / turn end (error), not every tick.
+
+    /// True when the transcript's most recent assistant entry is an API-error message.
+    private static func transcriptEndedInError(path: String) -> Bool {
+        (lastAssistantEntry(path: path)?["isApiErrorMessage"] as? Bool) == true
+    }
+
+    /// The pretty model name (e.g. "Opus 4.8") from the transcript's most recent assistant
+    /// entry, or nil if unknown.
+    private static func transcriptModel(path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let tail: UInt64 = 32_768
+        try? handle.seek(toOffset: size > tail ? size - tail : 0)
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        // Scan newest-first for the last assistant entry carrying a REAL model. Some surfaces
+        // interleave synthetic entries (model "<synthetic>"); skip those so the menu bar shows
+        // the actual model, never the placeholder.
+        for line in text.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  (obj["type"] as? String) == "assistant",
+                  let msg = obj["message"] as? [String: Any],
+                  let raw = (msg["model"] as? String)?.trimmingCharacters(in: .whitespaces),
+                  !raw.isEmpty, !raw.hasPrefix("<") else { continue }
+            return CostService.displayName(raw)
+        }
+        return nil
+    }
+
+    /// The most recent `type == "assistant"` entry, parsed from the transcript's tail (last
+    /// 32 KB). Scanning newest-first means a partial leading line simply fails to parse and is
+    /// skipped. Returns nil on any read/parse failure (best-effort, never throws into the poll).
+    private static func lastAssistantEntry(path: String) -> [String: Any]? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let tail: UInt64 = 32_768
+        try? handle.seek(toOffset: size > tail ? size - tail : 0)
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  (obj["type"] as? String) == "assistant" else { continue }
+            return obj
+        }
+        return nil
     }
 
     private func nonEmpty(_ v: Any?) -> String? {
@@ -444,9 +576,13 @@ final class ActivityService {
     session="$(field session_id)"
     cwd="$(field cwd)"
     note="$(field notification_type)"
+    transcript="$(field transcript_path)"
+    # Which Claude Code surface fired this hook (the raw entrypoint: the terminal vs a GUI app).
+    # It arrives as an inherited env var, not a stdin field, so the menu bar can label CLI vs app.
+    client="${CLAUDE_CODE_ENTRYPOINT:-}"
     ts="$(date +%s)"
-    payload="$(printf '{"event":"%s","tool":"%s","session":"%s","cwd":"%s","note":"%s","ts":%s}' \
-      "$event" "$tool" "$session" "$cwd" "$note" "$ts")"
+    payload="$(printf '{"event":"%s","tool":"%s","session":"%s","cwd":"%s","note":"%s","transcript":"%s","client":"%s","ts":%s}' \
+      "$event" "$tool" "$session" "$cwd" "$note" "$transcript" "$client" "$ts")"
     # Latest-event file (the single most recent event across all sessions).
     tmp="$state.tmp.$$"
     printf '%s\n' "$payload" > "$tmp" 2>/dev/null
