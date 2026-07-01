@@ -16,10 +16,10 @@ import FoundationModels
 
 // MARK: - Summary backend
 //
-// Which engine generates AI summaries. Selectable in Settings so an open-source user
-// can pick what they have: the local Claude Code CLI (Haiku, cheap + high quality, the
-// default since this app already targets Claude Code users), Apple's on-device model
-// (free + private but needs macOS 26 + Apple silicon), or Off (fall back to raw text).
+// Which engine generates AI summaries. Off by default; selectable in Settings so a
+// user can opt into what they have: the local Claude Code CLI (Haiku, cheap + high
+// quality, but spawns a session per summary), Apple's on-device model (free + private
+// but needs macOS 26 + Apple silicon), or Off (fall back to raw text).
 enum SummaryBackend: String, CaseIterable, Identifiable, Hashable {
     case claude   // local `claude` CLI, Haiku model
     case apple    // Apple Intelligence (on-device Foundation Models)
@@ -34,13 +34,13 @@ enum SummaryBackend: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
-    /// The persisted choice (UserDefaults key shared with Settings). Defaults to Apple
-    /// Intelligence: it runs on-device with no extra Claude sessions or menu-bar noise
-    /// (the Claude CLI backend spawns a logged session per summary). Users without Apple
-    /// Intelligence can pick Claude in onboarding / Settings.
+    /// The persisted choice (UserDefaults key shared with Settings). Defaults to Off:
+    /// a fresh install should never spawn Claude sessions on its own, and Apple
+    /// Intelligence isn't available on every Mac (needs macOS 26 on Apple silicon),
+    /// so summaries are strictly opt-in via Settings.
     static var current: SummaryBackend {
         SummaryBackend(rawValue: UserDefaults.standard.string(forKey: "summaryBackend") ?? "")
-            ?? .apple
+            ?? .off
     }
 
     /// True when a transcript's first user prompt is one of Cortex's OWN summary tasks.

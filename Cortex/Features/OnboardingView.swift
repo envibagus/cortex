@@ -16,10 +16,6 @@ struct OnboardingView: View {
     // cancelled session leaves the persisted roots untouched.
     @State private var draftRoots: [String] = []
 
-    // Draft AI-summary engine, seeded from the persisted choice on appear and written
-    // back on completion. Defaults to Apple Intelligence (on-device, no extra sessions).
-    @State private var draftBackend: SummaryBackend = .apple
-
     var body: some View {
         // A plain NavigationStack (no sidebar) gives the onboarding its own toolbar
         // with just the "Cortex" title on the left, independent of the app's shell.
@@ -31,7 +27,6 @@ struct OnboardingView: View {
                     VStack(spacing: 28) {
                         welcomeHeader
                         scanRootsCard
-                        summaryBackendCard
                         privacyNote
                         primaryActions
                     }
@@ -45,46 +40,6 @@ struct OnboardingView: View {
         }
         .onAppear {
             draftRoots = model.scanRoots
-            draftBackend = SummaryBackend.current
-        }
-    }
-
-    // MARK: - AI Summaries card
-    //
-    // Pick which engine writes the short session / agent summaries. Defaults to Claude
-    // (Haiku) since this app already targets Claude Code users; the choice is persisted
-    // to the same UserDefaults key Settings uses.
-
-    private var summaryBackendCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 14) {
-                SectionHeader(icon: "sparkles", title: "AI Summaries", tint: Theme.accent)
-
-                Text("How Cortex writes short summaries of your sessions and agents.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Picker("AI summary engine", selection: $draftBackend) {
-                    ForEach(SummaryBackend.allCases) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-
-                Text(backendHint)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    // A one-line description of the drafted engine, mirroring the Settings footer.
-    private var backendHint: String {
-        switch draftBackend {
-        case .apple: "Apple Intelligence runs on-device (needs macOS 26 on Apple silicon) - private, free, no extra Claude sessions. Recommended."
-        case .claude: "Claude (Haiku) summarizes via your local Claude Code CLI - higher quality, but spawns a short Claude session per summary."
-        case .off: "Off shows the raw first lines instead of an AI summary."
         }
     }
 
@@ -218,9 +173,8 @@ struct OnboardingView: View {
         }
     }
 
-    /// Persist the chosen roots + summary engine, mark onboarding done, load the workspace.
+    /// Persist the chosen roots, mark onboarding done, load the workspace.
     private func completeOnboarding() {
-        UserDefaults.standard.set(draftBackend.rawValue, forKey: "summaryBackend")
         Task { await model.completeOnboarding(roots: draftRoots) }
     }
 }
