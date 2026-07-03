@@ -227,6 +227,14 @@ private enum UsageProbe {
                     if let m = claudeWindowMetric(json[key], label: label) { metrics.append(m) }
                 }
             }
+            // Claude Design is a top-level named window (Anthropic codename "omelette"), not
+            // a weekly_scoped model, so the limits[] loop never surfaces it. Read it directly:
+            // seven_day_omelette, or omelette_promotional on migrated accounts. Both are null
+            // on plans without a Design allocation, which yields no row.
+            if let design = claudeWindowMetric(json["seven_day_omelette"], label: "Claude Design · weekly")
+                ?? claudeWindowMetric(json["omelette_promotional"], label: "Claude Design · weekly") {
+                metrics.append(design)
+            }
             // Extra Usage only appears when pay-as-you-go credits are actually in use.
             if let extra = claudeExtraUsage(json["extra_usage"]) { metrics.append(extra) }
 
@@ -239,10 +247,11 @@ private enum UsageProbe {
         }
     }
 
-    /// A Claude usage window -> metric. Windows look like `{ utilization: 30, resets_at: ... }`.
+    /// A Claude usage window -> metric. Windows look like `{ utilization: 30, resets_at: ... }`;
+    /// newer named windows may carry `percent` instead, so accept either.
     private static func claudeWindowMetric(_ raw: Any?, label: String) -> UsageMetric? {
         guard let win = raw as? [String: Any] else { return nil }
-        guard let util = num(win["utilization"]) else { return nil }
+        guard let util = num(win["utilization"]) ?? num(win["percent"]) else { return nil }
         return UsageMetric(label: label, percent: util, resetsAt: parseDate(win["resets_at"]))
     }
 

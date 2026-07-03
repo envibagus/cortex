@@ -34,17 +34,41 @@ struct UsageView: View {
     }
 
     private var scaffold: some View {
-        PageScaffold(
+        // Only show a card for a provider the user actually has (configured, erroring, or
+        // still probing); hide the ones not set up. A small note names the hidden ones so
+        // it's clear they'll appear once installed, and a full empty state covers "none".
+        let shown = model.usage.providers.filter { Self.isPresent($0.result) }
+        let hiddenNames = model.usage.providers.filter { !Self.isPresent($0.result) }.map(\.name)
+
+        return PageScaffold(
             title: "Usage",
             subtitle: "Live limits across your AI coding subscriptions"
         ) {
-            // One card per provider.
             VStack(spacing: 16) {
-                ForEach(model.usage.providers) { provider in
-                    ProviderUsageCard(provider: provider)
+                if shown.isEmpty {
+                    // Nothing detected at all: one empty state naming every provider.
+                    GroupBox {
+                        CortexEmptyState(
+                            icon: "gauge.with.dots.needle.67percent",
+                            title: "No usage sources yet",
+                            message: "Claude, Codex, Cursor, and Antigravity usage will appear here once you sign in to or install them.")
+                            .frame(maxWidth: .infinity)
+                    }
+                } else {
+                    // One card per detected provider.
+                    ForEach(shown) { provider in
+                        ProviderUsageCard(provider: provider)
+                    }
+                    // Name the providers not set up, so it's clear more can appear.
+                    if !hiddenNames.isEmpty {
+                        Text("\(Self.joinNames(hiddenNames)) will appear here once installed.")
+                            .font(.cortexCaption)
+                            .foregroundStyle(Theme.textTertiary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                    // Daily token usage over the last 30 days (from local Claude sessions).
+                    DailyTokensCard()
                 }
-                // Daily token usage over the last 30 days (from local Claude sessions).
-                DailyTokensCard()
             }
 
             if let last = model.usage.lastRefresh {
@@ -53,6 +77,24 @@ struct UsageView: View {
                     .foregroundStyle(Theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
             }
+        }
+    }
+
+    /// A provider counts as "present" unless the probe says it isn't set up. `.ok`,
+    /// `.error` (configured but failing), and `.loading` (still probing) all show; only
+    /// `.notConfigured` hides.
+    private static func isPresent(_ result: UsageResult) -> Bool {
+        if case .notConfigured = result { return false }
+        return true
+    }
+
+    /// "Codex" / "Codex and Cursor" / "Codex, Cursor, and Antigravity".
+    private static func joinNames(_ names: [String]) -> String {
+        switch names.count {
+        case 0: return ""
+        case 1: return names[0]
+        case 2: return "\(names[0]) and \(names[1])"
+        default: return names.dropLast().joined(separator: ", ") + ", and " + (names.last ?? "")
         }
     }
 }
