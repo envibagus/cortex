@@ -108,4 +108,11 @@ enum UsageDisplay {
         let shown = UsageHeat.percentLabel(shownPercent(percent, mode: mode))
         return mode == .left ? "\(shown) left" : "\(shown) used"
     }
+
+    /// Both readings at once for the Usage detail page, e.g. "12% used · 88% left".
+    static func captionBoth(_ percent: Double) -> String {
+        let used = UsageHeat.percentLabel(percent)
+        let left = UsageHeat.percentLabel(max(0, 100 - percent))
+        return "\(used) used · \(left) left"
+    }
 }

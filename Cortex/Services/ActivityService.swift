@@ -689,17 +689,16 @@ final class WorkflowMonitor {
                     let journal = run.appendingPathComponent("journal.jsonl")
                     guard let mtime = (try? journal.resourceValues(
                             forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-                          now.timeIntervalSince(mtime) < staleCap,
-                          let content = try? String(contentsOf: journal, encoding: .utf8)
+                          now.timeIntervalSince(mtime) < staleCap
                     else { continue }
                     var started = Set<String>(), completed = Set<String>()
-                    for line in content.split(separator: "\n") {
-                        guard let data = line.data(using: .utf8),
-                              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    JSONLines.forEachLine(in: journal) { data in
+                        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                               let type = obj["type"] as? String,
-                              let agentId = obj["agentId"] as? String else { continue }
+                              let agentId = obj["agentId"] as? String else { return true }
                         if type == "started" { started.insert(agentId) }
                         else if type == "result" { completed.insert(agentId) }
+                        return true
                     }
                     let done = completed.intersection(started).count
                     let inFlight = started.count > done

@@ -27,6 +27,11 @@ final class SessionStore {
     /// merged with live day buckets (live wins for days it still has).
     private var cacheUsage: [Date: [String: TokenUsage]] = [:]
 
+    /// Per-file parse results from the previous scan, keyed by file path. A file whose
+    /// mtime + size are unchanged is not re-read on the next scan, so a refresh only
+    /// pays for transcripts that actually changed since the last one.
+    private var fileCache: [String: FileCacheEntry] = [:]
+
     private let cost: CostService
 
     init(cost: CostService) { self.cost = cost }
@@ -37,6 +42,7 @@ final class SessionStore {
         sessions = []
         dayBuckets = [:]
         cacheUsage = [:]
+        fileCache = [:]
         lastScan = nil
     }
 
@@ -47,15 +53,17 @@ final class SessionStore {
         let pricing = cost.pricing
         let normalize = { (raw: String) in CostService.staticNormalizeKey(raw) }
 
+        let cacheIn = fileCache
         let parsed = await Task.detached(priority: .userInitiated) {
-            Self.parseAll(pricing: pricing, normalize: normalize)
+            Self.parseAll(pricing: pricing, normalize: normalize, cache: cacheIn)
         }.value
         let cache = await Task.detached(priority: .utility) {
             Self.loadCostCache()
         }.value
 
-        self.sessions = parsed.sessions.sorted { $0.endedAt > $1.endedAt }
-        self.dayBuckets = parsed.dayBuckets
+        self.sessions = parsed.output.sessions.sorted { $0.endedAt > $1.endedAt }
+        self.dayBuckets = parsed.output.dayBuckets
+        self.fileCache = parsed.cache
         self.cacheUsage = cache
         self.lastScan = Date()
         self.isLoading = false
@@ -363,14 +371,190 @@ final class SessionStore {
         var ephemeral_1h_input_tokens: Int?
     }
 
+    // MARK: - Incremental parsing
+    //
+    // parseAll runs in two phases. Phase 1 extracts per-file "facts" - envelope
+    // metadata, per-day message counts, attribution tallies, and the file's assistant
+    // turns after in-file streaming dedup. Facts depend only on that one file, so
+    // they are cached by (path, mtime, size) and reused until the file changes on
+    // disk. Phase 2 merges facts in a deterministic order, applying the cross-file
+    // billing dedup (one API response billed once across ALL transcripts) exactly as
+    // the line-by-line parse did. Files are streamed via JSONLines, so no transcript
+    // is ever fully resident in memory.
+
+    /// Facts extracted from ONE transcript file, independent of every other file.
+    /// Cross-file billing dedup happens later, in the merge phase.
+    nonisolated struct FileFacts: Sendable {
+        // Envelope metadata (collected only for a session's main transcript).
+        var cwd: String?
+        var branch: String?
+        var lastPrompt: String?
+        var slug: String?
+        var aiTitle: String?
+        var entrypoint: String?
+        var version: String?
+        var first: Date?
+        var last: Date?
+        var userCount = 0
+        /// Per-day user-message counts (messages without a timestamp count toward `userCount` only).
+        var userMsgsByDay: [Date: Int] = [:]
+        /// Attribution tallies: day -> kind raw value -> name -> count.
+        var attribution: [Date: [String: [String: Int]]] = [:]
+        /// Assistant responses after in-file streaming dedup, in file order.
+        var turns: [Turn] = []
+
+        struct Turn: Sendable {
+            /// Stable hash of "messageId|requestId" for cross-file billing dedup;
+            /// nil when the line carried no message id (such turns always bill).
+            var keyHash: UInt64?
+            var model: String
+            var usage: TokenUsage
+            var date: Date?
+            var day: Date?
+            var hour: Int
+        }
+    }
+
+    nonisolated struct FileCacheEntry: Sendable {
+        var modified: Date
+        var size: Int
+        var facts: FileFacts
+    }
+
+    /// FNV-1a 64-bit over the key's UTF-8 bytes. Deterministic (unlike Hasher's
+    /// per-process seeded hashes), so cached turns keep valid dedup keys across
+    /// scans. Collisions are astronomically unlikely at this population
+    /// (~10^5 keys in a 2^64 space).
+    private nonisolated static func fnv1a(_ s: String) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x0000_0100_0000_01b3 }
+        return h
+    }
+
+    /// Phase 1: stream one transcript and extract its facts.
+    /// Returns nil when the file could not be opened (nothing is cached then, so a
+    /// later scan retries instead of remembering an empty result).
+    private nonisolated static func extractFacts(
+        url: URL,
+        isMain: Bool,
+        decoder: JSONDecoder,
+        iso: ISO8601DateFormatter,
+        isoPlain: ISO8601DateFormatter,
+        cal: Calendar,
+        normalize: (String) -> String
+    ) -> FileFacts? {
+        var f = FileFacts()
+        var pending: [FileFacts.Turn] = []
+        var pendingIndex: [String: Int] = [:]
+
+        func parseDate(_ s: String?) -> Date? {
+            guard let s else { return nil }
+            return iso.date(from: s) ?? isoPlain.date(from: s)
+        }
+
+        let opened = JSONLines.forEachLine(in: url) { data in
+            guard let line = try? decoder.decode(Line.self, from: data) else { return true }
+            if isMain {
+                if f.cwd == nil, let c = line.cwd { f.cwd = c }
+                if let b = line.gitBranch, !b.isEmpty { f.branch = b }
+                if let lp = line.lastPrompt, !lp.isEmpty { f.lastPrompt = lp }
+                if f.slug == nil, let s = line.slug, !s.isEmpty { f.slug = s }
+                if let t = line.aiTitle, !t.isEmpty { f.aiTitle = t }
+                if f.entrypoint == nil, let e = line.entrypoint, !e.isEmpty { f.entrypoint = e }
+                if let v = line.version, !v.isEmpty { f.version = v }
+            }
+
+            let date = parseDate(line.timestamp)
+            if isMain, let date {
+                if f.first == nil || date < f.first! { f.first = date }
+                if f.last == nil || date > f.last! { f.last = date }
+            }
+            let day = date.map { cal.startOfDay(for: $0) }
+
+            if let day {
+                func bump(_ kind: AttributionKind, _ name: String?) {
+                    guard let name, !name.isEmpty else { return }
+                    f.attribution[day, default: [:]][kind.rawValue, default: [:]][name, default: 0] += 1
+                }
+                bump(.skill, line.attributionSkill)
+                bump(.plugin, line.attributionPlugin)
+                bump(.mcpServer, line.attributionMcpServer)
+                bump(.mcpTool, line.attributionMcpTool)
+                bump(.subagent, line.agentName)
+            }
+
+            switch line.type {
+            case "user":
+                guard isMain else { break }
+                f.userCount += 1
+                if let day { f.userMsgsByDay[day, default: 0] += 1 }
+            case "assistant":
+                let modelKey = line.message?.model.map(normalize) ?? "unknown"
+                var u = TokenUsage()
+                if let mu = line.message?.usage {
+                    // Cache writes split by TTL when the breakdown is present
+                    // (5m and 1h bill at different rates); older transcripts
+                    // carry only the total, treated as 5m.
+                    let cw5m: Int, cw1h: Int
+                    if let cc = mu.cache_creation {
+                        cw5m = cc.ephemeral_5m_input_tokens ?? 0
+                        cw1h = cc.ephemeral_1h_input_tokens ?? 0
+                    } else {
+                        cw5m = mu.cache_creation_input_tokens ?? 0
+                        cw1h = 0
+                    }
+                    u = TokenUsage(
+                        input: mu.input_tokens ?? 0,
+                        output: mu.output_tokens ?? 0,
+                        cacheRead: mu.cache_read_input_tokens ?? 0,
+                        cacheWrite: cw5m,
+                        cacheWrite1h: cw1h
+                    )
+                }
+                let key = line.message?.id.map { "\($0)|\(line.requestId ?? "")" }
+                if let key {
+                    if let idx = pendingIndex[key] {
+                        // Later line of the same streamed response: token
+                        // counts are cumulative, so the newest wins.
+                        pending[idx].model = modelKey
+                        pending[idx].usage = u
+                        return true
+                    }
+                    pendingIndex[key] = pending.count
+                }
+                pending.append(FileFacts.Turn(
+                    keyHash: key.map(Self.fnv1a),
+                    model: modelKey,
+                    usage: u,
+                    date: date,
+                    day: day,
+                    hour: date.map { cal.component(.hour, from: $0) } ?? 0
+                ))
+            default:
+                break
+            }
+            return true
+        }
+        guard opened else { return nil }
+
+        f.turns = pending
+        return f
+    }
+
+    /// Parse every transcript under ~/.claude/projects into sessions + day buckets.
+    /// `cache` carries per-file facts from the previous scan; files whose mtime and
+    /// size are unchanged are not re-read. Returns the fresh cache alongside the
+    /// output (files that vanished from disk drop out because the cache is rebuilt
+    /// from the current walk).
     nonisolated static func parseAll(
         pricing: [String: ModelPricing],
-        normalize: (String) -> String
-    ) -> ParseOutput {
+        normalize: (String) -> String,
+        cache: [String: FileCacheEntry]
+    ) -> (output: ParseOutput, cache: [String: FileCacheEntry]) {
         let fm = FileManager.default
         let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
         guard let projectDirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else {
-            return ParseOutput(sessions: [], dayBuckets: [:])
+            return (ParseOutput(sessions: [], dayBuckets: [:]), [:])
         }
 
         let iso = ISO8601DateFormatter()
@@ -380,10 +564,6 @@ final class SessionStore {
         let cal = Calendar.current
         let decoder = JSONDecoder()
 
-        func parseDate(_ s: String?) -> Date? {
-            guard let s else { return nil }
-            return iso.date(from: s) ?? isoPlain.date(from: s)
-        }
         func priceOf(_ key: String) -> ModelPricing {
             CostService.price(forKey: key, in: pricing)
         }
@@ -395,24 +575,16 @@ final class SessionStore {
 
         var sessions: [ClaudeSession] = []
         var dayBuckets: [Date: DayBucket] = [:]
-        // One API response can span several transcript lines: Claude Code writes a line
-        // per content block (each carrying the response's usage, updated as it streams),
-        // and resumed sessions copy earlier lines into the new file. Billing a response
-        // more than once inflates cost, so each (message id, request id) pair is counted
-        // exactly once across ALL transcripts.
-        var billedResponses = Set<String>()
+        var newCache: [String: FileCacheEntry] = [:]
+        newCache.reserveCapacity(max(cache.count, 64))
+        // One API response can span several transcript lines and files (streamed
+        // content blocks, resumed sessions copying earlier lines). Each hashed
+        // (message id, request id) pair bills exactly once across ALL transcripts.
+        // The walk below is fully sorted so the same file claims a duplicated
+        // response on every scan, keeping per-session numbers stable.
+        var billedResponses = Set<UInt64>()
 
-        // An assistant response buffered until its file is fully read, so the LAST line
-        // of a streamed response - the one with final token counts - is the one billed.
-        struct PendingTurn {
-            var key: String?
-            var model: String
-            var usage: TokenUsage
-            var date: Date?
-            var day: Date?
-        }
-
-        for projectDir in projectDirs {
+        for projectDir in projectDirs.sorted(by: { $0.path < $1.path }) {
             guard (try? projectDir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
 
             // A session's transcripts span multiple files: the main <sessionId>.jsonl at
@@ -430,22 +602,14 @@ final class SessionStore {
                 }
             }
 
-            for (sessionId, group) in groups {
+            for (sessionId, group) in groups.sorted(by: { $0.key < $1.key }) {
                 var first: Date?, last: Date?
                 var userCount = 0, assistantCount = 0
                 var usage = TokenUsage(), totalCost = 0.0
                 var modelCount: [String: Int] = [:]
                 var usageByModel: [String: TokenUsage] = [:]
                 var cwd: String?, branch: String?, lastPrompt: String?
-                // Session naming + provenance. `slug` is stamped on most lines and is
-                // effectively constant per file (first non-empty wins); `aiTitle` arrives
-                // late on a dedicated line (latest non-empty wins); `entrypoint` is set at
-                // session start (first non-empty wins).
                 var slug: String?, aiTitle: String?, entrypoint: String?, version: String?
-                // Context the latest assistant turn carried (input + cache tokens). Lines
-                // are chronological, so the final assignment is the most recent turn - an
-                // honest absolute count (we don't infer a % since the window size isn't
-                // recorded; see ClaudeSession.lastContextTokens).
                 var lastContextTokens = 0
 
                 // Main transcript first: session metadata, message counts, and the
@@ -456,95 +620,55 @@ final class SessionStore {
                 files += group.subs.sorted { $0.path < $1.path }.map { ($0, false) }
 
                 for (file, isMain) in files {
-                    guard let raw = try? String(contentsOf: file, encoding: .utf8) else { continue }
-                    var pending: [PendingTurn] = []
-                    var pendingIndex: [String: Int] = [:]
-
-                    for lineStr in raw.split(separator: "\n", omittingEmptySubsequences: true) {
-                        guard let data = lineStr.data(using: .utf8),
-                              let line = try? decoder.decode(Line.self, from: data) else { continue }
-                        if isMain {
-                            if cwd == nil, let c = line.cwd { cwd = c }
-                            if let b = line.gitBranch, !b.isEmpty { branch = b }
-                            if let lp = line.lastPrompt, !lp.isEmpty { lastPrompt = lp }
-                            if slug == nil, let s = line.slug, !s.isEmpty { slug = s }
-                            if let t = line.aiTitle, !t.isEmpty { aiTitle = t }
-                            if entrypoint == nil, let e = line.entrypoint, !e.isEmpty { entrypoint = e }
-                            if let v = line.version, !v.isEmpty { version = v }
-                        }
-
-                        let date = parseDate(line.timestamp)
-                        if isMain, let date {
-                            if first == nil || date < first! { first = date }
-                            if last == nil || date > last! { last = date }
-                        }
-                        let day = date.map { cal.startOfDay(for: $0) }
-
-                        // Attribution: tally which skill / plugin / MCP server+tool / subagent
-                        // produced this line into the day bucket (any line type can carry it).
-                        if let day {
-                            func bump(_ kind: AttributionKind, _ name: String?) {
-                                guard let name, !name.isEmpty else { return }
-                                dayBuckets[day, default: DayBucket(date: day)]
-                                    .attribution[kind.rawValue, default: [:]][name, default: 0] += 1
-                            }
-                            bump(.skill, line.attributionSkill)
-                            bump(.plugin, line.attributionPlugin)
-                            bump(.mcpServer, line.attributionMcpServer)
-                            bump(.mcpTool, line.attributionMcpTool)
-                            bump(.subagent, line.agentName)
-                        }
-
-                        switch line.type {
-                        case "user":
-                            guard isMain else { break }
-                            userCount += 1
-                            if let day { dayBuckets[day, default: DayBucket(date: day)].userMsgs += 1 }
-                            if let day { dayBuckets[day]?.sessions.insert(sessionId) }
-                        case "assistant":
-                            let modelKey = line.message?.model.map(normalize) ?? "unknown"
-                            var u = TokenUsage()
-                            if let mu = line.message?.usage {
-                                // Cache writes split by TTL when the breakdown is present
-                                // (5m and 1h bill at different rates); older transcripts
-                                // carry only the total, treated as 5m.
-                                let cw5m: Int, cw1h: Int
-                                if let cc = mu.cache_creation {
-                                    cw5m = cc.ephemeral_5m_input_tokens ?? 0
-                                    cw1h = cc.ephemeral_1h_input_tokens ?? 0
-                                } else {
-                                    cw5m = mu.cache_creation_input_tokens ?? 0
-                                    cw1h = 0
-                                }
-                                u = TokenUsage(
-                                    input: mu.input_tokens ?? 0,
-                                    output: mu.output_tokens ?? 0,
-                                    cacheRead: mu.cache_read_input_tokens ?? 0,
-                                    cacheWrite: cw5m,
-                                    cacheWrite1h: cw1h
-                                )
-                            }
-                            let key = line.message?.id.map { "\($0)|\(line.requestId ?? "")" }
-                            if let key {
-                                if let idx = pendingIndex[key] {
-                                    // Later line of the same streamed response: token
-                                    // counts are cumulative, so the newest wins.
-                                    pending[idx].model = modelKey
-                                    pending[idx].usage = u
-                                    continue
-                                }
-                                if billedResponses.contains(key) { continue }
-                                pendingIndex[key] = pending.count
-                            }
-                            pending.append(PendingTurn(key: key, model: modelKey, usage: u, date: date, day: day))
-                        default:
-                            break
-                        }
+                    // Phase 1: cached facts when mtime + size are unchanged, else re-extract.
+                    let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                    let modified = attrs?.contentModificationDate
+                    let size = attrs?.fileSize
+                    let facts: FileFacts
+                    if let modified, let size, let hit = cache[file.path],
+                       hit.modified == modified, hit.size == size {
+                        facts = hit.facts
+                    } else if let fresh = autoreleasepool(invoking: { Self.extractFacts(
+                        url: file, isMain: isMain, decoder: decoder,
+                        iso: iso, isoPlain: isoPlain, cal: cal, normalize: normalize) }) {
+                        facts = fresh
+                    } else {
+                        continue // unreadable file: same as the legacy skip, and not cached
+                    }
+                    if let modified, let size {
+                        newCache[file.path] = FileCacheEntry(modified: modified, size: size, facts: facts)
                     }
 
-                    // Commit this file's unique responses.
-                    for turn in pending {
-                        if let key = turn.key { billedResponses.insert(key) }
+                    // Phase 2: merge this file's facts into the session + day buckets.
+                    if isMain {
+                        cwd = facts.cwd
+                        branch = facts.branch
+                        lastPrompt = facts.lastPrompt
+                        slug = facts.slug
+                        aiTitle = facts.aiTitle
+                        entrypoint = facts.entrypoint
+                        version = facts.version
+                        first = facts.first
+                        last = facts.last
+                        userCount = facts.userCount
+                    }
+                    for (day, n) in facts.userMsgsByDay {
+                        dayBuckets[day, default: DayBucket(date: day)].userMsgs += n
+                        dayBuckets[day]?.sessions.insert(sessionId)
+                    }
+                    for (day, kinds) in facts.attribution {
+                        for (kind, names) in kinds {
+                            for (name, n) in names {
+                                dayBuckets[day, default: DayBucket(date: day)]
+                                    .attribution[kind, default: [:]][name, default: 0] += n
+                            }
+                        }
+                    }
+                    for turn in facts.turns {
+                        if let kh = turn.keyHash {
+                            if billedResponses.contains(kh) { continue }
+                            billedResponses.insert(kh)
+                        }
                         modelCount[turn.model, default: 0] += 1
                         usage.add(turn.usage)
                         usageByModel[turn.model, default: TokenUsage()].add(turn.usage)
@@ -561,10 +685,10 @@ final class SessionStore {
                             dayBuckets[day, default: DayBucket(date: day)]
                                 .usageByModel[turn.model, default: TokenUsage()].add(turn.usage)
                             dayBuckets[day]?.cost += c
-                            if isMain, let date = turn.date {
+                            if isMain, turn.date != nil {
                                 dayBuckets[day]?.assistantMsgs += 1
                                 dayBuckets[day]?.sessions.insert(sessionId)
-                                dayBuckets[day]?.hourly[cal.component(.hour, from: date)] += 1
+                                dayBuckets[day]?.hourly[turn.hour] += 1
                             }
                         }
                     }
@@ -603,7 +727,7 @@ final class SessionStore {
             }
         }
 
-        return ParseOutput(sessions: sessions, dayBuckets: dayBuckets)
+        return (ParseOutput(sessions: sessions, dayBuckets: dayBuckets), newCache)
     }
 
     /// Best-effort decode of a project slug back into a path.

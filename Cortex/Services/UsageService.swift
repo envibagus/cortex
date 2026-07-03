@@ -120,14 +120,16 @@ final class UsageService {
 
         async let claude = UsageProbe.claude()
         async let codex = UsageProbe.codex()
-        let (claudeResult, codexResult) = await (claude, codex)
+        async let cursor = UsageProbe.cursor()
+        async let antigravity = UsageProbe.antigravity()
+        let (claudeResult, codexResult, cursorResult, antigravityResult) =
+            await (claude, codex, cursor, antigravity)
 
         providers = [
             ProviderUsage(id: .claude, result: claudeResult),
             ProviderUsage(id: .codex, result: codexResult),
-            ProviderUsage(id: .cursor, result: .notConfigured(
-                "Cursor stores usage behind its dashboard RPC. Not wired into Cortex yet.")),
-            ProviderUsage(id: .antigravity, result: UsageProbe.antigravity()),
+            ProviderUsage(id: .cursor, result: cursorResult),
+            ProviderUsage(id: .antigravity, result: antigravityResult),
         ]
         lastRefresh = Date()
         // Retain last-known-good metrics across TRANSIENT failures (network / rate-limit) so a
@@ -196,12 +198,34 @@ private enum UsageProbe {
             }
 
             var metrics: [UsageMetric] = []
-            if let m = claudeWindowMetric(json["five_hour"], label: "Session") { metrics.append(m) }
-            if let m = claudeWindowMetric(json["seven_day"], label: "Weekly") { metrics.append(m) }
-            // Per-model weekly windows (seven_day_sonnet, seven_day_opus, ...) as extras.
-            for key in json.keys.sorted() where key.hasPrefix("seven_day_") {
-                let label = claudeWeeklyModelLabel(key)
-                if let m = claudeWindowMetric(json[key], label: label) { metrics.append(m) }
+            if let limits = json["limits"] as? [[String: Any]], !limits.isEmpty {
+                // Current API shape: one `limits` entry per window, including per-model
+                // scoped weeklies (kind "weekly_scoped" + scope.model.display_name, e.g.
+                // Fable). The flat seven_day_* keys are null on these accounts.
+                for entry in limits {
+                    guard let pct = num(entry["percent"]) else { continue }
+                    let label: String
+                    switch entry["kind"] as? String {
+                    case "session": label = "Session"
+                    case "weekly_all": label = "Weekly"
+                    case "weekly_scoped": label = claudeScopedLimitLabel(entry)
+                    case let kind?:
+                        let pretty = kind.replacingOccurrences(of: "_", with: " ")
+                        label = pretty.prefix(1).uppercased() + pretty.dropFirst()
+                    case nil: continue
+                    }
+                    metrics.append(UsageMetric(label: label, percent: pct,
+                                               resetsAt: parseDate(entry["resets_at"])))
+                }
+            } else {
+                // Legacy flat shape (older accounts / API versions).
+                if let m = claudeWindowMetric(json["five_hour"], label: "Session") { metrics.append(m) }
+                if let m = claudeWindowMetric(json["seven_day"], label: "Weekly") { metrics.append(m) }
+                // Per-model weekly windows (seven_day_sonnet, seven_day_opus, ...) as extras.
+                for key in json.keys.sorted() where key.hasPrefix("seven_day_") {
+                    let label = claudeWeeklyModelLabel(key)
+                    if let m = claudeWindowMetric(json[key], label: label) { metrics.append(m) }
+                }
             }
             // Extra Usage only appears when pay-as-you-go credits are actually in use.
             if let extra = claudeExtraUsage(json["extra_usage"]) { metrics.append(extra) }
@@ -220,6 +244,22 @@ private enum UsageProbe {
         guard let win = raw as? [String: Any] else { return nil }
         guard let util = num(win["utilization"]) else { return nil }
         return UsageMetric(label: label, percent: util, resetsAt: parseDate(win["resets_at"]))
+    }
+
+    /// A "weekly_scoped" limits entry -> "<Model> · weekly", from the scope's model
+    /// display name (e.g. Fable). Falls back to the surface name, then a generic label.
+    private static func claudeScopedLimitLabel(_ entry: [String: Any]) -> String {
+        let scope = entry["scope"] as? [String: Any]
+        if let model = scope?["model"] as? [String: Any],
+           let name = (model["display_name"] as? String)?.trimmingCharacters(in: .whitespaces),
+           !name.isEmpty {
+            return "\(name) · weekly"
+        }
+        if let surface = (scope?["surface"] as? String)?.trimmingCharacters(in: .whitespaces),
+           !surface.isEmpty {
+            return "\(surface) · weekly"
+        }
+        return "Scoped · weekly"
     }
 
     /// "seven_day_sonnet" -> "Sonnet · weekly". Keeps Anthropic's odd codenames readable.
@@ -359,12 +399,160 @@ private enum UsageProbe {
         }
     }
 
+    // MARK: Cursor
+
+    /// Cursor keeps its OAuth session in the editor's SQLite state DB
+    /// (~/Library/Application Support/Cursor/User/globalStorage/state.vscdb), key
+    /// `cursorAuth/accessToken`. We read it via the sqlite3 CLI (same read-only,
+    /// signature-stable approach as the keychain read) and call Cursor's own dashboard
+    /// RPC - the same endpoint the editor's usage panel uses. These are undocumented
+    /// internal endpoints, so failures stay soft (loading / not configured / error).
+    static func cursor() async -> UsageResult {
+        guard let token = readCursorToken(), !token.isEmpty else {
+            return .notConfigured("Not signed in. Open Cursor and sign in.")
+        }
+        let membership = readCursorValue("cursorAuth/stripeMembershipType")
+
+        func rpc(_ path: String) async -> (status: Int, json: [String: Any]?)? {
+            guard let url = URL(string: "https://api2.cursor.sh/aiserver.v1.DashboardService/\(path)") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 12
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+            req.httpBody = Data("{}".utf8)
+            guard let (data, response) = try? await URLSession.shared.data(for: req) else { return nil }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return (status, try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        guard let usage = await rpc("GetCurrentPeriodUsage") else {
+            return .error("Couldn't reach Cursor. Check your connection.")
+        }
+        if usage.status == 401 || usage.status == 403 {
+            return .error("Cursor session expired. Sign in again in Cursor.")
+        }
+        guard (200..<300).contains(usage.status), let json = usage.json else {
+            return .error("Cursor usage request failed (HTTP \(usage.status)).")
+        }
+        // A disabled/absent plan usage block means there's nothing to meter.
+        guard (json["enabled"] as? Bool) != false,
+              let planUsage = json["planUsage"] as? [String: Any] else {
+            return .ok(plan: cursorPlanLabel(nil, membership: membership), metrics: [])
+        }
+
+        // Monthly billing cycle -> reset date (epoch ms, sent as a string).
+        let resetsAt = parseDate(json["billingCycleEnd"])
+
+        var metrics: [UsageMetric] = []
+        // Total plan usage: the endpoint's own percent, else derived from limit/spend.
+        let totalPct: Double?
+        if let p = num(planUsage["totalPercentUsed"]) {
+            totalPct = p
+        } else if let limit = num(planUsage["limit"]), limit > 0 {
+            let spend = num(planUsage["totalSpend"]) ?? (limit - (num(planUsage["remaining"]) ?? 0))
+            totalPct = spend / limit * 100
+        } else {
+            totalPct = nil
+        }
+        if let totalPct {
+            metrics.append(UsageMetric(label: "Usage", percent: totalPct, resetsAt: resetsAt))
+        }
+        // Auto vs API split, shown only when actually in use.
+        if let auto = num(planUsage["autoPercentUsed"]), auto > 0 {
+            metrics.append(UsageMetric(label: "Auto", percent: auto, resetsAt: resetsAt))
+        }
+        if let api = num(planUsage["apiPercentUsed"]), api > 0 {
+            metrics.append(UsageMetric(label: "API", percent: api, resetsAt: resetsAt))
+        }
+        // On-demand spend cap, when the user has one set.
+        if let spend = json["spendLimitUsage"] as? [String: Any],
+           let limitCents = num(spend["individualLimit"]), limitCents > 0 {
+            let remaining = num(spend["individualRemaining"]) ?? 0
+            let usedCents = max(0, limitCents - remaining)
+            metrics.append(UsageMetric(
+                label: "On-demand", percent: usedCents / limitCents * 100, resetsAt: resetsAt,
+                detail: "$\(money(usedCents / 100)) of $\(money(limitCents / 100))"))
+        }
+
+        // Plan name from GetPlanInfo, falling back to the stored membership type.
+        var planName: String?
+        if let plan = await rpc("GetPlanInfo")?.json,
+           let info = plan["planInfo"] as? [String: Any] {
+            planName = info["planName"] as? String
+        }
+        return .ok(plan: cursorPlanLabel(planName, membership: membership), metrics: metrics)
+    }
+
+    private static func cursorPlanLabel(_ planName: String?, membership: String?) -> String? {
+        if let p = planName?.trimmingCharacters(in: .whitespaces), !p.isEmpty { return p }
+        guard let m = membership?.trimmingCharacters(in: .whitespaces), !m.isEmpty else { return nil }
+        return m.prefix(1).uppercased() + m.dropFirst()
+    }
+
+    /// Read the Cursor access token from the editor's SQLite state DB.
+    private static func readCursorToken() -> String? { readCursorValue("cursorAuth/accessToken") }
+
+    /// Read one ItemTable value from Cursor's state.vscdb via the sqlite3 CLI. Returns
+    /// nil when the DB or key is absent (Cursor not installed / not signed in).
+    private static func readCursorValue(_ key: String) -> String? {
+        let db = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        guard FileManager.default.fileExists(atPath: db) else { return nil }
+        let escaped = key.replacingOccurrences(of: "'", with: "''")
+        return runTool("/usr/bin/sqlite3",
+                       ["-batch", "-noheader", db,
+                        "SELECT value FROM ItemTable WHERE key='\(escaped)' LIMIT 1;"])
+    }
+
     // MARK: Antigravity
 
-    /// Antigravity (the `agy` CLI) keeps the selected model in a local, non-secret
-    /// settings file, but exposes no readable usage/quota source. So we surface the
-    /// current model only and stay honest about limits not being available.
-    static func antigravity() -> UsageResult {
+    /// Antigravity's `agy` / language-server process runs a local Connect-RPC service on a
+    /// loopback HTTPS port (self-signed cert). While it's running it answers
+    /// `RetrieveUserQuotaSummary` - the same call the IDE's own usage panel makes - with the
+    /// per-pool quota windows, and `GetUserStatus` with the plan. We discover the port via
+    /// `lsof`, call over loopback only, and need no token/secret. When the process isn't
+    /// running there is no live source, so we fall back to showing the configured model from
+    /// the local settings file (no limits).
+    static func antigravity() async -> UsageResult {
+        let ports = antigravityLoopbackPorts()
+        for port in ports {
+            guard let summary = await antigravityLSCall(port: port, method: "RetrieveUserQuotaSummary"),
+                  let response = summary["response"] as? [String: Any],
+                  let groups = response["groups"] as? [[String: Any]], !groups.isEmpty else { continue }
+
+            var metrics: [UsageMetric] = []
+            for group in groups {
+                let groupName = (group["displayName"] as? String) ?? ""
+                let buckets = (group["buckets"] as? [[String: Any]]) ?? []
+                // Session (5h) before Weekly, matching the Claude card's window order.
+                let ordered = buckets.sorted { ($0["window"] as? String) == "5h" && ($1["window"] as? String) != "5h" }
+                for bucket in ordered {
+                    guard let remaining = num(bucket["remainingFraction"]) else { continue }
+                    let label = antigravityBucketLabel(bucket, groupName: groupName)
+                    metrics.append(UsageMetric(
+                        label: label,
+                        percent: (1 - remaining) * 100,
+                        resetsAt: parseDate(bucket["resetTime"])))
+                }
+            }
+            guard !metrics.isEmpty else { continue }
+
+            // Plan (best-effort) from GetUserStatus. We read only the plan name, never the
+            // name/email the same response also carries.
+            var plan: String?
+            if let status = await antigravityLSCall(port: port, method: "GetUserStatus"),
+               let userStatus = status["userStatus"] as? [String: Any],
+               let planStatus = userStatus["planStatus"] as? [String: Any],
+               let info = planStatus["planInfo"] as? [String: Any] {
+                let raw = (info["planName"] as? String)?.trimmingCharacters(in: .whitespaces)
+                plan = (raw?.isEmpty == false) ? raw : nil
+            }
+            return .ok(plan: plan, metrics: metrics)
+        }
+
+        // No live language server: fall back to the configured model name (no limits).
         let path = (NSHomeDirectory() as NSString)
             .appendingPathComponent(".gemini/antigravity-cli/settings.json")
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -374,6 +562,69 @@ private enum UsageProbe {
             return .notConfigured("Not set up. Run `agy` to pick a model.")
         }
         return .ok(plan: model, metrics: [])
+    }
+
+    /// A quota bucket -> readable label. Known pool ids get concise names; unknown ids fall
+    /// back to the group's display name plus the window, so a future pool still renders.
+    private static func antigravityBucketLabel(_ bucket: [String: Any], groupName: String) -> String {
+        let window = (bucket["window"] as? String) ?? ""
+        let windowLabel = window == "5h" ? "5h" : (window == "weekly" ? "Weekly" : window)
+        switch bucket["bucketId"] as? String {
+        case "gemini-5h": return "Gemini · 5h"
+        case "gemini-weekly": return "Gemini · Weekly"
+        case "3p-5h": return "Claude/GPT · 5h"
+        case "3p-weekly": return "Claude/GPT · Weekly"
+        default:
+            // "Gemini Models" -> "Gemini"; keep it short, then append the window.
+            let shortGroup = groupName
+                .replacingOccurrences(of: " Models", with: "")
+                .replacingOccurrences(of: " models", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            let base = shortGroup.isEmpty ? "Antigravity" : shortGroup
+            return windowLabel.isEmpty ? base : "\(base) · \(windowLabel)"
+        }
+    }
+
+    /// Listening loopback TCP ports of the running `agy` / `language_server` processes,
+    /// discovered via `ps` + `lsof`. Empty when Antigravity isn't running.
+    private static func antigravityLoopbackPorts() -> [Int] {
+        guard let psOut = runTool("/bin/ps", ["-ax", "-o", "pid=,comm="]) else { return [] }
+        var pids: [String] = []
+        for line in psOut.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let sp = trimmed.firstIndex(of: " ") else { continue }
+            let pid = String(trimmed[..<sp])
+            let comm = String(trimmed[trimmed.index(after: sp)...])
+            let name = (comm as NSString).lastPathComponent
+            if name == "agy" || name.contains("language_server") { pids.append(pid) }
+        }
+        var ports: [Int] = []
+        for pid in pids {
+            guard let out = runTool("/usr/sbin/lsof",
+                                    ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid]) else { continue }
+            for m in out.matches(of: /127\.0\.0\.1:(\d+)/) {
+                if let p = Int(m.output.1), !ports.contains(p) { ports.append(p) }
+            }
+        }
+        return ports
+    }
+
+    /// POST a language-server Connect-RPC method over loopback HTTPS (self-signed cert,
+    /// trusted for 127.0.0.1 only). Returns the parsed JSON, or nil on any failure.
+    private static func antigravityLSCall(port: Int, method: String) async -> [String: Any]? {
+        guard let url = URL(string: "https://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/\(method)")
+        else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 8
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        let meta = ["metadata": ["ideName": "antigravity", "extensionName": "antigravity",
+                                 "ideVersion": "unknown", "locale": "en"]]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: meta)
+        guard let (data, response) = try? await LoopbackTrust.session.data(for: req),
+              (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
     // MARK: Credential loading (read-only)
@@ -475,6 +726,29 @@ private enum UsageProbe {
         return Data(text.utf8)
     }
 
+    /// Run a read-only command-line tool and return its trimmed stdout, or nil on any
+    /// non-zero exit / launch failure. Used for the sqlite3 CLI read of Cursor's state
+    /// DB (mirrors the `security` CLI approach: an Apple-signed, stable-signature tool).
+    private static func runTool(_ path: String, _ args: [String]) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        let stdout = Pipe()
+        proc.standardOutput = stdout
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text?.isEmpty == false) ? text : nil
+    }
+
     // MARK: Parsing helpers
 
     /// Parse JSON that is either raw UTF-8 or hex-encoded UTF-8 (some Keychain payloads).
@@ -527,5 +801,31 @@ private enum UsageProbe {
 
     private static func money(_ v: Double) -> String {
         v == v.rounded() ? String(Int(v.rounded())) : String(format: "%.2f", v)
+    }
+}
+
+// MARK: - Loopback TLS trust
+//
+// The Antigravity language server serves its RPC over HTTPS with a self-signed cert on a
+// 127.0.0.1 port. This session accepts the server trust ONLY for the loopback host, so the
+// self-signed cert is honored for that local call while every remote request (Claude / Codex
+// / Cursor, which use URLSession.shared) keeps full certificate validation.
+private final class LoopbackTrust: NSObject, URLSessionDelegate, @unchecked Sendable {
+    static let session: URLSession = {
+        URLSession(configuration: .ephemeral, delegate: LoopbackTrust(), delegateQueue: nil)
+    }()
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              challenge.protectionSpace.host == "127.0.0.1",
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 }

@@ -11,22 +11,19 @@ struct UsageView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        // The two toolbar buttons draw their OWN circular glass (square frame + glassPill).
-        // On macOS 26 the toolbar's shared system glass is suppressed per item, so they show
-        // as two separate CIRCLES instead of one wide shared oval. Pre-26 uses the plain
-        // toolbar (each control renders on its own).
+        // A single refresh control. The detail rows always show both used/left and both
+        // relative/absolute resets, so there is no per-page display toggle to host here;
+        // the compact surfaces' used-vs-left preference lives in Settings > Menu Bar. The
+        // button draws its own circular glass (square frame + glassPill); on macOS 26 the
+        // toolbar's shared system glass is suppressed per item.
         Group {
             if #available(macOS 26.0, *) {
                 scaffold.toolbar {
-                    ToolbarItem(placement: .primaryAction) { UsageOptionsMenu() }
-                        .sharedBackgroundVisibility(.hidden)
-                    ToolbarSpacer(.fixed)
                     ToolbarItem(placement: .primaryAction) { RefreshControl() }
                         .sharedBackgroundVisibility(.hidden)
                 }
             } else {
                 scaffold.toolbar {
-                    ToolbarItem(placement: .primaryAction) { UsageOptionsMenu() }
                     ToolbarItem(placement: .primaryAction) { RefreshControl() }
                 }
             }
@@ -86,57 +83,6 @@ private struct RefreshControl: View {
         .help("Refresh usage")
         .disabled(model.usage.isRefreshing)
         .accessibilityIdentifier("usage-refresh")
-    }
-}
-
-// MARK: - Usage display options
-//
-// An in-app menu (on the Usage toolbar) mirroring the menu-bar display preferences, so
-// the user can flip used/left and reset-time style right from the Usage page. Bound to
-// the same AppModel preferences, so the menu bar updates in lockstep.
-
-private struct UsageOptionsMenu: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        Menu {
-            Picker("Show Usage As", selection: usageModeBinding) {
-                ForEach(UsageDisplayMode.allCases) { Text($0.label).tag($0) }
-            }
-            Picker("Reset Times", selection: resetStyleBinding) {
-                ForEach(ResetTimerStyle.allCases) { Text($0.label).tag($0) }
-            }
-            if model.menuBarResetStyle == .absolute {
-                Picker("Time Format", selection: timeFormatBinding) {
-                    ForEach(MenuBarTimeFormat.allCases) { Text($0.label).tag($0) }
-                }
-            }
-        } label: {
-            Image(systemName: "slider.horizontal.3")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(Theme.textSecondary)
-                .frame(width: 30, height: 30)
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        // Constrain the Menu itself (not just its label) to a square so glassPill's Capsule
-        // renders a CIRCLE. A Menu reserves extra width otherwise, which is why it stayed
-        // oval while the Button-based refresh control already went circular.
-        .frame(width: 30, height: 30)
-        .glassPill()
-        .help("Usage display options")
-        .accessibilityIdentifier("usage-options")
-    }
-
-    private var usageModeBinding: Binding<UsageDisplayMode> {
-        Binding(get: { model.menuBarUsageMode }, set: { model.menuBarUsageMode = $0 })
-    }
-    private var resetStyleBinding: Binding<ResetTimerStyle> {
-        Binding(get: { model.menuBarResetStyle }, set: { model.menuBarResetStyle = $0 })
-    }
-    private var timeFormatBinding: Binding<MenuBarTimeFormat> {
-        Binding(get: { model.menuBarTimeFormat }, set: { model.menuBarTimeFormat = $0 })
     }
 }
 
@@ -291,9 +237,10 @@ private struct UsageProgressRow: View {
             }
             .frame(height: 8)
 
-            // Percent (left, used vs left per preference) + reset / detail caption (right)
+            // Percent (both used and left) on the left, reset / detail caption on the right.
+            // The detail page shows everything rather than a single toggled reading.
             HStack {
-                Text(UsageDisplay.captionLabel(metric.percent, mode: model.menuBarUsageMode))
+                Text(UsageDisplay.captionBoth(metric.percent))
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.textSecondary)
                 Spacer()
@@ -307,12 +254,12 @@ private struct UsageProgressRow: View {
         .onAppear { withAnimation(.easeOut(duration: 0.6).delay(0.3)) { filled = true } }
     }
 
+    /// Right caption: a dollar/extra detail when present, else both the relative countdown
+    /// and the absolute clock (e.g. "Resets in 9h 47m · today at 11:04").
     private var rightCaption: String? {
         if let detail = metric.detail { return detail }
         if let resetsAt = metric.resetsAt {
-            return UsageHeat.resetText(resetsAt,
-                                       style: model.menuBarResetStyle,
-                                       timeFormat: model.menuBarTimeFormat)
+            return UsageHeat.resetTextBoth(resetsAt, timeFormat: model.menuBarTimeFormat)
         }
         return nil
     }
@@ -407,6 +354,14 @@ enum UsageHeat {
         case .absolute:
             return "Resets \(absoluteReset(date, timeFormat: timeFormat))"
         }
+    }
+
+    /// Both the countdown and the clock time, for the Usage detail page:
+    /// "Resets in 9h 47m · today at 11:04".
+    static func resetTextBoth(_ date: Date, timeFormat: MenuBarTimeFormat) -> String {
+        let secs = Int(max(0, date.timeIntervalSinceNow))
+        if secs < 60 { return "Resets now" }
+        return "\(resetText(date)) · \(absoluteReset(date, timeFormat: timeFormat))"
     }
 
     /// "today at 11:04" / "tomorrow at 9:00" / "Jun 30 at 11:04", 12- or 24-hour per

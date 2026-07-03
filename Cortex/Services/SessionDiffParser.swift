@@ -22,10 +22,6 @@ enum SessionDiffParser {
     // MARK: Parse
 
     static func parse(url: URL) -> SessionDiff {
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
-            return SessionDiff(files: [])
-        }
-
         // Accumulate per-file edits keyed by absolute path, preserving first-seen order.
         var byPath: [String: FileEdit] = [:]
         var order: [String] = []
@@ -61,12 +57,14 @@ enum SessionDiffParser {
             byPath[path] = file
         }
 
-        for lineStr in raw.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let data = lineStr.data(using: .utf8),
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        // Streamed line by line so a multi-megabyte transcript is never fully
+        // resident in memory. An unopenable file yields the same empty diff the
+        // whole-file read produced.
+        JSONLines.forEachLine(in: url) { data in
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   (root["type"] as? String) == "assistant",
                   let message = root["message"] as? [String: Any],
-                  let blocks = message["content"] as? [Any] else { continue }
+                  let blocks = message["content"] as? [Any] else { return true }
 
             for block in blocks {
                 guard let bd = block as? [String: Any],
@@ -99,6 +97,7 @@ enum SessionDiffParser {
                     break
                 }
             }
+            return true
         }
 
         return SessionDiff(files: order.compactMap { byPath[$0] })

@@ -795,10 +795,6 @@ enum ReplayParser {
     private static let valueLimit = 400
 
     static func parse(url: URL) -> Result<[ReplayEvent], Failure> {
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
-            return .failure(Failure(message: "The transcript file could not be read. It may have moved or be binary."))
-        }
-
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let isoPlain = ISO8601DateFormatter()
@@ -819,10 +815,11 @@ enum ReplayParser {
             idx += 1
         }
 
-        for lineStr in raw.split(separator: "\n", omittingEmptySubsequences: true) {
-            if out.count >= maxEvents { break }
-            guard let data = lineStr.data(using: .utf8),
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+        // Streamed line by line so a multi-megabyte transcript is never fully
+        // resident in memory; reading stops early once the event cap is reached.
+        let opened = JSONLines.forEachLine(in: url) { data in
+            if out.count >= maxEvents { return false }
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return true }
 
             let type = (root["type"] as? String) ?? ""
             let stamp = (root["timestamp"] as? String).flatMap { iso.date(from: $0) ?? isoPlain.date(from: $0) }
@@ -868,6 +865,10 @@ enum ReplayParser {
             default:
                 break
             }
+            return true
+        }
+        guard opened else {
+            return .failure(Failure(message: "The transcript file could not be read. It may have moved or be binary."))
         }
 
         return .success(out)

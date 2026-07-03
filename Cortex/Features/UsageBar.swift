@@ -3,12 +3,12 @@ import SwiftUI
 // MARK: - UsageBar
 //
 // A compact strip of the live Claude usage limits for the home Overview: the tool
-// name + plan badge, then the Session and Weekly windows as labelled progress bars
-// with a percent and a reset countdown (mirrors the reference design). Reads the same
-// UsageService the Usage page uses; calls load() in .task so the one-time Keychain
-// prompt only happens once and is shared with the Usage page. Shows only Claude
-// (the other providers are not configured); states stay honest (loading / not
-// connected / error) rather than faking numbers.
+// name + plan badge, then every reported limit window (Session, Weekly, per-model
+// weeklies like Fable, extra usage) as labelled progress bars with a percent and a
+// reset countdown. Reads the same UsageService the Usage page uses; calls load() in
+// .task so the one-time Keychain prompt only happens once and is shared with the
+// Usage page. Shows only Claude (the other providers are not configured); states
+// stay honest (loading / not connected / error) rather than faking numbers.
 
 struct UsageBar: View {
     @Environment(AppModel.self) private var model
@@ -50,14 +50,11 @@ struct UsageBar: View {
         case .loading:
             UsageBarSkeleton()
         case let .ok(_, metrics):
-            let session = metrics.first { $0.label == "Session" }
-            let weekly = metrics.first { $0.label == "Weekly" }
-            if session == nil && weekly == nil {
+            if metrics.isEmpty {
                 UsageBarNote(icon: "checkmark.circle", text: "No active limits right now.")
             } else {
                 VStack(spacing: 12) {
-                    if let session { UsageMiniRow(metric: session) }
-                    if let weekly { UsageMiniRow(metric: weekly) }
+                    ForEach(metrics) { UsageMiniRow(metric: $0) }
                 }
             }
         case let .notConfigured(message):
