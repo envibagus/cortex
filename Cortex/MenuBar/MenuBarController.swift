@@ -66,6 +66,11 @@ final class MenuBarController: NSObject {
     func applyVisibility(_ visible: Bool) {
         if visible {
             guard statusItem == nil else { return }
+            // Plain creation with the system-managed default autosave identity. Do NOT set
+            // `autosaveName` (or force `isVisible`) here: on macOS 26 renaming a status
+            // item's autosave name after creation orphans the menu bar engine's hosting
+            // registration for it - the item keeps a valid frame on the app side but is
+            // never drawn in the bar.
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
             item.button?.target = self
             item.button?.action = #selector(handleClick(_:))

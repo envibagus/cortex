@@ -187,8 +187,12 @@ private enum UsageProbe {
             if status == 401 || status == 403 {
                 return .error("Token expired. Open Claude Code to refresh.")
             }
-            if status == 429 {
-                return .error("Rate limited by Anthropic. Try again later.")
+            // Both 429 and 503 from this endpoint mean "too many requests" (rate limited). Do NOT
+            // retry quickly: the background refresh loop must BACK OFF (it uses the full interval
+            // on any error - see AppModel.startBackgroundLoops), otherwise fast re-probing keeps
+            // the endpoint rate-limited and the failure sticks. Surfaced as one transient message.
+            if status == 429 || status == 503 {
+                return .error("Rate limited by Anthropic. Backing off; try again shortly.")
             }
             guard (200..<300).contains(status) else {
                 return .error("Usage request failed (HTTP \(status)).")
@@ -198,33 +202,32 @@ private enum UsageProbe {
             }
 
             var metrics: [UsageMetric] = []
-            if let limits = json["limits"] as? [[String: Any]], !limits.isEmpty {
-                // Current API shape: one `limits` entry per window, including per-model
-                // scoped weeklies (kind "weekly_scoped" + scope.model.display_name, e.g.
-                // Fable). The flat seven_day_* keys are null on these accounts.
-                for entry in limits {
-                    guard let pct = num(entry["percent"]) else { continue }
-                    let label: String
-                    switch entry["kind"] as? String {
-                    case "session": label = "Session"
-                    case "weekly_all": label = "Weekly"
-                    case "weekly_scoped": label = claudeScopedLimitLabel(entry)
-                    case let kind?:
-                        let pretty = kind.replacingOccurrences(of: "_", with: " ")
-                        label = pretty.prefix(1).uppercased() + pretty.dropFirst()
-                    case nil: continue
-                    }
-                    metrics.append(UsageMetric(label: label, percent: pct,
-                                               resetsAt: parseDate(entry["resets_at"])))
+            // Current API shape: one `limits` entry per window, including per-model scoped
+            // weeklies (kind "weekly_scoped" + scope.model.display_name, e.g. Fable). The value
+            // arrives as `percent`, or `utilization` on some shapes; accept either.
+            for entry in (json["limits"] as? [[String: Any]]) ?? [] {
+                guard let pct = num(entry["percent"]) ?? num(entry["utilization"]) else { continue }
+                let label: String
+                switch entry["kind"] as? String {
+                case "session": label = "Session"
+                case "weekly_all": label = "Weekly"
+                case "weekly_scoped": label = claudeScopedLimitLabel(entry)
+                case let kind? where !kind.isEmpty:
+                    let pretty = kind.replacingOccurrences(of: "_", with: " ")
+                    label = pretty.prefix(1).uppercased() + pretty.dropFirst()
+                default: continue
                 }
-            } else {
-                // Legacy flat shape (older accounts / API versions).
+                metrics.append(UsageMetric(label: label, percent: pct,
+                                           resetsAt: parseDate(entry["resets_at"])))
+            }
+            // Legacy flat shape, parsed only when the limits array carried nothing usable
+            // (older accounts / API versions). seven_day_omelette is Claude Design, appended
+            // below, so it's excluded here to avoid a duplicate row.
+            if metrics.isEmpty {
                 if let m = claudeWindowMetric(json["five_hour"], label: "Session") { metrics.append(m) }
                 if let m = claudeWindowMetric(json["seven_day"], label: "Weekly") { metrics.append(m) }
-                // Per-model weekly windows (seven_day_sonnet, seven_day_opus, ...) as extras.
-                for key in json.keys.sorted() where key.hasPrefix("seven_day_") {
-                    let label = claudeWeeklyModelLabel(key)
-                    if let m = claudeWindowMetric(json[key], label: label) { metrics.append(m) }
+                for key in json.keys.sorted() where key.hasPrefix("seven_day_") && key != "seven_day_omelette" {
+                    if let m = claudeWindowMetric(json[key], label: claudeWeeklyModelLabel(key)) { metrics.append(m) }
                 }
             }
             // Claude Design is a top-level named window (Anthropic codename "omelette"), not
@@ -237,6 +240,13 @@ private enum UsageProbe {
             }
             // Extra Usage only appears when pay-as-you-go credits are actually in use.
             if let extra = claudeExtraUsage(json["extra_usage"]) { metrics.append(extra) }
+
+            // UsageMetric.id is its label, so two windows that resolve to the same label
+            // (e.g. a scoped entry with no model name, or Design coinciding with a scoped
+            // row) would collide as SwiftUI ForEach ids. Drop blank labels and keep the
+            // first of each label.
+            var seenLabels = Set<String>()
+            metrics = metrics.filter { !$0.label.isEmpty && seenLabels.insert($0.label).inserted }
 
             if metrics.isEmpty {
                 return .ok(plan: plan, metrics: [])
@@ -561,16 +571,28 @@ private enum UsageProbe {
             return .ok(plan: plan, metrics: metrics)
         }
 
-        // No live language server: fall back to the configured model name (no limits).
+        // Reached here = no usage quota was exposed. Read the configured model (best-effort) for
+        // the plan pill / status line.
         let path = (NSHomeDirectory() as NSString)
             .appendingPathComponent(".gemini/antigravity-cli/settings.json")
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let model = (root["model"] as? String)?.trimmingCharacters(in: .whitespaces),
-              !model.isEmpty else {
-            return .notConfigured("Not set up. Run `agy` to pick a model.")
+        let model: String? = {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let m = (root["model"] as? String)?.trimmingCharacters(in: .whitespaces),
+                  !m.isEmpty else { return nil }
+            return m
+        }()
+
+        // Antigravity only populates quota windows after the user actually sends messages to it,
+        // so an installed-but-idle agy has no metrics yet. Treat it as present (a real card, not
+        // hidden) whenever it's installed - a saved model config or the `agy` CLI on PATH - and
+        // let the UI show a "usage appears once you send messages" hint. Only a machine with no
+        // Antigravity at all stays hidden (named in the "appears once installed" note).
+        let installed = model != nil || Shell.which("agy") != nil
+        if installed {
+            return .ok(plan: model, metrics: [])
         }
-        return .ok(plan: model, metrics: [])
+        return .notConfigured("Not installed. Get Antigravity to see usage here.")
     }
 
     /// A quota bucket -> readable label. Known pool ids get concise names; unknown ids fall

@@ -66,6 +66,10 @@ struct InstructionsView: View {
             emptyIcon: ConfigKind.instruction.icon,
             emptyTitle: "No instructions selected",
             emptyMessage: "Select a CLAUDE.md or AGENTS.md on the left to read it.",
+            // Zero instruction docs at all (not merely filtered out): whole-pane empty state.
+            sourceIsEmpty: model.config.instructions.isEmpty,
+            zeroDataTitle: "No instructions yet",
+            zeroDataMessage: "CLAUDE.md and AGENTS.md files in your projects show up here.",
             // ⌘C copies the file path (Instructions are view-only in-app, so no ⌘E / ⌫).
             actions: { item in
                 PageActions(copyPath: { model.copyPath(item.path) })
@@ -220,9 +224,9 @@ private struct InstructionRow: View {
                 .foregroundStyle(Theme.textPrimary)
                 .lineLimit(1)
 
-            // Favorite indicator: a tiny star shown only when favorited.
+            // Favorite indicator: a tiny filled star shown only when favorited.
             if model.library.isFavorite(item.id) {
-                Image(systemName: "star")
+                Image(systemName: "star.fill")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.secondary)
             }

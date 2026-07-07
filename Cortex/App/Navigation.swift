@@ -22,6 +22,7 @@ enum Route: String, Hashable, Identifiable, CaseIterable, Codable {
     case repoPulse
     case diffs
     case snapshots
+    case environment
     // Library
     case skills
     case agents
@@ -54,6 +55,7 @@ enum Route: String, Hashable, Identifiable, CaseIterable, Codable {
         case .repoPulse: "Repo Pulse"
         case .diffs: "Diffs"
         case .snapshots: "Snapshots"
+        case .environment: "Environment"
         case .skills: "Skills"
         case .agents: "Agents"
         case .rules: "Rules"
@@ -84,6 +86,7 @@ enum Route: String, Hashable, Identifiable, CaseIterable, Codable {
         case .repoPulse: "waveform.path"
         case .diffs: "doc.on.doc"
         case .snapshots: "camera"
+        case .environment: "wrench.and.screwdriver"
         case .skills: "bolt"
         case .agents: "person.2"
         case .rules: "list.bullet.rectangle"
@@ -126,6 +129,7 @@ enum Route: String, Hashable, Identifiable, CaseIterable, Codable {
         case .repos: "git github projects"
         case .workGraph: "chart graph analytics"
         case .tools: "mcp servers integrations"
+        case .environment: "toolchain cli installed versions binaries path homebrew runtimes"
         default: title.lowercased()
         }
     }
@@ -144,6 +148,6 @@ enum Sidebar {
         SidebarSection(title: "Overview", routes: [.readout, .assistant]),
         SidebarSection(title: "Library", routes: [.skills, .agents, .rules, .commands, .tools, .plugins, .hooks, .memory, .instructions, .favorites, .collections]),
         SidebarSection(title: "Monitor", routes: [.usage, .live, .sessions, .costs, .ports]),
-        SidebarSection(title: "Workspace", routes: [.repos, .workGraph, .diffs, .snapshots, .health]),
+        SidebarSection(title: "Workspace", routes: [.repos, .workGraph, .diffs, .snapshots, .environment, .health]),
     ]
 }

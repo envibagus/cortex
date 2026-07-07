@@ -213,9 +213,12 @@ private struct ProviderUsageCard: View {
                     LoadingBars()
                 case let .ok(_, metrics):
                     if metrics.isEmpty {
-                        QuietNote(icon: provider.id == .antigravity ? "minus.circle" : "checkmark.circle",
+                        // Antigravity exposes quota only after the user sends it messages, so an
+                        // empty result means it's installed but has nothing to report yet. Hint at
+                        // how usage shows up instead of a plain "no limits" note.
+                        QuietNote(icon: provider.id == .antigravity ? "bubble.left.and.bubble.right" : "checkmark.circle",
                                   text: provider.id == .antigravity
-                                    ? "Antigravity doesn't expose usage limits."
+                                    ? "Usage appears once you start sending messages to Antigravity."
                                     : "No active limits right now.")
                     } else {
                         VStack(spacing: 14) {

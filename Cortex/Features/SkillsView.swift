@@ -127,6 +127,11 @@ struct ConfigBrowser: View {
             emptyIcon: kind.icon,
             emptyTitle: "No \(kind.singular.lowercased()) selected",
             emptyMessage: "Select a \(kind.singular.lowercased()) on the left to see its dashboard.",
+            // Zero items of this kind at all (not merely filtered out): a centered
+            // whole-pane state with the caller-supplied "how to add one" message.
+            sourceIsEmpty: items.isEmpty,
+            zeroDataTitle: "No \(kind.plural.lowercased()) yet",
+            zeroDataMessage: emptyMessage,
             // ⌘E opens the editor, ⌘C copies the path, ⌫ raises the delete confirmation
             // (via pendingDeleteItemID, which ConfigItemDetail watches).
             actions: { item in
@@ -161,25 +166,9 @@ struct ConfigBrowser: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.canvas)
-        // When the search filters out the current selection, fall back to the first
-        // remaining row (or nothing) so the detail pane never shows a stale item.
-        .onChange(of: query) { _, _ in
-            if let id = selectedID, !filtered.contains(where: { $0.id == id }) {
-                selectedID = filtered.first?.id
-            }
-        }
-        // Same fallback when the scope filter hides the current selection.
-        .onChange(of: scope) { _, _ in
-            if let id = selectedID, !filtered.contains(where: { $0.id == id }) {
-                selectedID = filtered.first?.id
-            }
-        }
-        // Same fallback when the origin filter hides the current selection.
-        .onChange(of: origin) { _, _ in
-            if let id = selectedID, !filtered.contains(where: { $0.id == id }) {
-                selectedID = filtered.first?.id
-            }
-        }
+        // A selection hidden by the search / scope / origin filters (or removed by a
+        // delete) is reconciled by SplitDetailView itself: it moves the selection to
+        // the neighboring row, so no per-filter fallback handlers are needed here.
         // A freshly created item (in THIS browser's list) becomes the selection so its
         // detail mounts and ConfigItemDetail can auto-open the editor. Guard on the id
         // belonging here so the other browsers (a different kind) ignore it.
@@ -469,10 +458,10 @@ private struct ConfigItemRow: View {
 
             Spacer(minLength: 8)
 
-            // Favorite indicator: an outline star shown only when favorited
+            // Favorite indicator: a filled star shown only when favorited
             // (.primary marks the active/favorited state, grayscale chrome).
             if model.library.isFavorite(item.id) {
-                Image(systemName: "star")
+                Image(systemName: "star.fill")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
             }

@@ -15,51 +15,74 @@ struct MenuBarPanel: View {
     @State private var filled = false
 
     private var claude: ProviderUsage? { model.usage.providers.first { $0.id == .claude } }
-    private var codex: ProviderUsage? { model.usage.providers.first { $0.id == .codex } }
+    private func usage(_ id: UsageProviderID) -> ProviderUsage? { model.usage.providers.first { $0.id == id } }
+
+    /// A non-Claude provider is shown when the user has it enabled AND it returned real data.
+    private func providerVisible(_ id: UsageProviderID) -> Bool {
+        guard model.isMenuBarProviderEnabled(id) else { return false }
+        if case .ok = usage(id)?.result { return true }
+        return false
+    }
+
+    /// The provider whose name titles the panel header (so the header is never an empty row with
+    /// just a floating refresh button): Claude when enabled, otherwise the first enabled provider.
+    /// At least one provider is always enabled (see AppModel.setMenuBarProvider).
+    private var primaryProvider: UsageProviderID {
+        if model.isMenuBarProviderEnabled(.claude) { return .claude }
+        return [.codex, .cursor, .antigravity].first { model.isMenuBarProviderEnabled($0) } ?? .claude
+    }
+
+    /// The panel's content sections in order, only the visible ones. Rendered with a single
+    /// divider between each (see body). The primary provider's title lives in the header, so its
+    /// own section omits the title to avoid repeating it.
+    private func visibleSections() -> [AnyView] {
+        var out: [AnyView] = []
+        let primary = primaryProvider
+
+        // Orphan workflows (no matching running session).
+        let orphanWorkflows = model.workflows.workflows.filter { wf in
+            !model.activity.activeSessions.contains { $0.projectName == wf.project }
+        }
+        if !orphanWorkflows.isEmpty { out.append(AnyView(workflowSection(orphanWorkflows))) }
+
+        // What's running right now (live activity).
+        if model.menuBarLiveActivityEnabled {
+            if !model.activity.activeSessions.isEmpty {
+                out.append(AnyView(runningSessionsSection))
+            } else if model.activity.current.isActive {
+                out.append(AnyView(activityRow))
+            }
+        }
+
+        // Claude usage (+ spend) when enabled. Its title is in the header, so claudeSection is
+        // title-less by design.
+        if model.isMenuBarProviderEnabled(.claude) {
+            out.append(AnyView(claudeSection))
+            if model.menuBarShowSpend, model.isReady, case .ok = claude?.result {
+                out.append(AnyView(UsageHistoryRows()))
+            }
+        }
+
+        // The other providers, each only when enabled AND it returned data. The primary (shown in
+        // the header) omits its own title.
+        for id in [UsageProviderID.codex, .cursor, .antigravity] where providerVisible(id) {
+            out.append(AnyView(providerSection(id, showTitle: id != primary)))
+        }
+        return out
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
 
-            // Workflows whose project has NO active running session are shown standalone here;
-            // matched ones surface as an "N agents" chip UNDER their session row below, so the
-            // agent count lives with the session it belongs to.
-            let orphanWorkflows = model.workflows.workflows.filter { wf in
-                !model.activity.activeSessions.contains { $0.projectName == wf.project }
-            }
-            if !orphanWorkflows.isEmpty {
-                workflowSection(orphanWorkflows)
-                Divider().overlay(Theme.stroke)
-            }
-
-            // What's running right now. Any session in a turn (even one) gets the detailed
-            // per-session breakdown - project + activity, with CLI / model / uptime / agents -
-            // so the richer detail shows without needing two concurrent sessions. The compact
-            // single row is kept only for the transient Done / Error flash after the last turn
-            // ends (no active sessions, but `current` is briefly non-idle).
-            if model.menuBarLiveActivityEnabled {
-                if !model.activity.activeSessions.isEmpty {
-                    runningSessionsSection
-                    Divider().overlay(Theme.stroke)
-                } else if model.activity.current.isActive {
-                    activityRow
-                    Divider().overlay(Theme.stroke)
-                }
-            }
-
-            claudeSection
-
-            // The spend breakdown (today / last 7 / last 30 days cost + tokens), unless the
-            // user hid it. Only when the heavy session data is loaded (the window has been
-            // opened); otherwise it's been freed to save memory, so skip it.
-            if model.menuBarShowSpend, model.isReady, case .ok = claude?.result {
-                Divider().overlay(Theme.stroke)
-                UsageHistoryRows()
-            }
-
-            if case .ok = codex?.result {
-                Divider().overlay(Theme.stroke)
-                codexSection
+            // Visible sections separated by exactly ONE divider each, with none between the header
+            // and the first section. Building the list explicitly (rather than each section adding
+            // its own leading/trailing divider) means toggling Claude or a provider off can never
+            // leave a doubled divider or an empty gap.
+            let sections = visibleSections()
+            ForEach(sections.indices, id: \.self) { i in
+                if i > 0 { Divider().overlay(Theme.stroke) }
+                sections[i]
             }
 
             Divider().overlay(Theme.stroke)
@@ -76,15 +99,19 @@ struct MenuBarPanel: View {
     // MARK: Header (Claude + plan + refresh)
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "sparkle")
+        // Title the header with the primary enabled provider (Claude, or the first enabled one if
+        // Claude is off) so it's never an empty row with just a floating refresh button.
+        let p = primaryProvider
+        let isClaude = p == .claude
+        return HStack(spacing: 8) {
+            Image(systemName: isClaude ? "sparkle" : p.symbol)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Theme.claude)
-            Text("Claude")
+                .foregroundStyle(isClaude ? Theme.claude : Theme.textSecondary)
+            Text(p.name)
                 .font(.system(size: 15, weight: .bold))
                 .foregroundStyle(Theme.textPrimary)
-            if case let .ok(plan, _) = claude?.result, let plan, !plan.isEmpty {
-                Pill(text: plan, tint: Theme.claude)
+            if case let .ok(plan, _) = usage(p)?.result, let plan, !plan.isEmpty {
+                Pill(text: plan, tint: isClaude ? Theme.claude : Theme.textSecondary)
             }
             Spacer(minLength: 8)
             refreshButton
@@ -252,31 +279,52 @@ struct MenuBarPanel: View {
         }
     }
 
-    // MARK: Codex (only when connected)
+    // MARK: Non-Claude providers (Codex / Cursor / Antigravity), shown only when connected
 
-    @ViewBuilder private var codexSection: some View {
-        if case let .ok(plan, metrics) = codex?.result {
+    /// One provider's section: (optionally) its name + plan pill over its usage rows. `showTitle`
+    /// is false for the primary provider, whose name already titles the panel header. Rendered
+    /// only for a provider whose probe returned `.ok` (callers gate on `providerVisible`).
+    @ViewBuilder private func providerSection(_ id: UsageProviderID, showTitle: Bool = true) -> some View {
+        if case let .ok(plan, metrics) = usage(id)?.result {
             VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    Text("Codex")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(Theme.textPrimary)
-                    if let plan, !plan.isEmpty {
-                        Pill(text: plan, tint: Theme.textSecondary)
+                if showTitle {
+                    HStack(spacing: 8) {
+                        Text(id.name)
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(Theme.textPrimary)
+                        if let plan, !plan.isEmpty {
+                            Pill(text: plan, tint: Theme.textSecondary)
+                        }
+                        Spacer()
                     }
-                    Spacer()
                 }
-                ForEach(panelMetrics(metrics)) { UsageMiniRow(metric: $0) }
+                if metrics.isEmpty {
+                    // Antigravity exposes quota only after the user sends it messages, so an empty
+                    // result means it's installed with nothing to report yet. Hint at that instead
+                    // of an empty section.
+                    if id == .antigravity {
+                        HStack(spacing: 6) {
+                            Image(systemName: "bubble.left.and.bubble.right")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.textSecondary)
+                            Text("Usage appears once you send messages")
+                                .font(.caption)
+                                .foregroundStyle(Theme.textSecondary)
+                        }
+                    }
+                } else {
+                    ForEach(panelMetrics(metrics)) { UsageMiniRow(metric: $0) }
+                }
             }
         }
     }
 
-    /// Keep the panel compact: Session, Weekly, and any dollar-denominated extra usage
-    /// (the per-model weekly windows stay on the full Usage page).
+    /// Show the same usage windows as the full Usage page: Session, Weekly, the per-model
+    /// weekly windows (e.g. Fable, Claude Design), and any dollar-denominated extra usage,
+    /// so per-model weeklies like Fable appear in the menu bar too. Already ordered + deduped
+    /// by UsageService (Session, Weekly, scoped weeklies, Design, Extra).
     private func panelMetrics(_ metrics: [UsageMetric]) -> [UsageMetric] {
-        [metrics.first { $0.label == "Session" },
-         metrics.first { $0.label == "Weekly" },
-         metrics.first { $0.label == "Extra usage" }].compactMap { $0 }
+        metrics
     }
 
     // MARK: Footer

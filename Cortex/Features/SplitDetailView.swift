@@ -33,6 +33,15 @@ struct SplitDetailView<Item: Identifiable, ListHeader: View, Row: View, Detail: 
     var emptyIcon: String = "square.dashed"
     var emptyTitle: String = "Nothing selected"
     var emptyMessage: String = "Select an item on the left to see its details."
+    // Whole-pane zero-data state, shown INSTEAD of the list + detail when the caller's
+    // UNDERLYING collection is empty. `sourceIsEmpty` must reflect the unfiltered
+    // array: `items` arrives post-filter, and a search that matches nothing must keep
+    // the normal split (hiding it would remove the search field mid-typing). The page
+    // chrome (title band) stays in place on this branch, so the toolbar is never torn
+    // down by the swap. Both strings must be set for the state to render.
+    var sourceIsEmpty: Bool = false
+    var zeroDataTitle: String? = nil
+    var zeroDataMessage: String? = nil
     // Optional custom empty-state view (shown when nothing is selected). When nil the
     // default CortexEmptyState (icon/title/message) is used, so existing call sites are
     // unchanged. Used by Sessions to show its aggregate dashboard as the default pane.
@@ -60,17 +69,39 @@ struct SplitDetailView<Item: Identifiable, ListHeader: View, Row: View, Detail: 
         // Apply the shared page chrome (title in the band) only when a title is provided,
         // and the soft top scroll-edge blur so the band frosts as the list scrolls under it.
         if let title {
-            core
+            content
                 .cortexScrollEdge()
                 .cortexPageChrome(title, subtitle: subtitle, count: count)
         } else {
-            core
+            content
         }
+    }
+
+    // The core stays mounted even in the zero-data state; the empty state covers it
+    // as an opaque overlay. Swapping the core out (unmounting its native List/scroll
+    // views) triggers an AppKit re-layout that strands the SIDEBAR's scroll offset up
+    // over the traffic lights - with an overlay, nothing is ever torn down.
+    private var content: some View {
+        core.overlay {
+            if sourceIsEmpty, let zeroDataTitle, let zeroDataMessage {
+                CortexEmptyState(icon: emptyIcon, title: zeroDataTitle, message: zeroDataMessage)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Theme.canvas)
+            }
+        }
+    }
+
+    // Whether the whole-pane zero-data overlay is up (see `content`). The core then
+    // skips the skeleton and builds the (empty, cheap) real layout immediately: the
+    // skeleton respects the top safe area while the real list extends under the band,
+    // so flipping between them resizes the pane and slides the centered overlay.
+    private var zeroOverlayActive: Bool {
+        sourceIsEmpty && zeroDataTitle != nil && zeroDataMessage != nil
     }
 
     private var core: some View {
         ZStack {
-            if ready || !showSkeleton {
+            if ready || !showSkeleton || zeroOverlayActive {
                 listAndDetail.transition(.opacity)
             } else {
                 SplitDetailSkeleton(listWidth: listWidth).transition(.opacity)
@@ -87,7 +118,7 @@ struct SplitDetailView<Item: Identifiable, ListHeader: View, Row: View, Detail: 
                 withAnimation(.easeOut(duration: 0.2)) { ready = true }
             }
         }
-        .onChange(of: items.map(\.id)) { _, _ in selectFirstIfNeeded() }
+        .onChange(of: items.map(\.id)) { old, new in reconcileSelection(from: old, to: new) }
         // ⌘R (refreshAll) bumps refreshToken: replay the skeleton while the data reloads,
         // then crossfade back so any newly-scanned items appear behind the shimmer.
         .onChange(of: model.refreshToken) { _, _ in
@@ -198,6 +229,28 @@ struct SplitDetailView<Item: Identifiable, ListHeader: View, Row: View, Detail: 
         }
         if selectedID == nil, let first = items.first?.id {
             selectedID = first
+        }
+    }
+
+    // Keeps the selection valid as the data changes. When the selected row disappears
+    // (deleted, unfavorited, or filtered out), the selection moves to the row that took
+    // its index - the NEXT item - or to the new last row when it was already at the end,
+    // instead of jumping back to the top of the list.
+    private func reconcileSelection(from old: [Item.ID], to new: [Item.ID]) {
+        // Callers that supply their own default pane (autoSelectFirst == false, e.g. the
+        // Sessions aggregate dashboard) manage their own selection: a dropped selection must
+        // fall through to their emptyContent, never auto-advance to a neighbor. This mirrors
+        // the guard the replaced selectFirstIfNeeded() opened with.
+        guard autoSelectFirst else { return }
+        if let sel = selectedID, !new.contains(sel) {
+            if let oldIndex = old.firstIndex(of: sel), !new.isEmpty {
+                selectedID = new[min(oldIndex, new.count - 1)]
+                return
+            }
+            selectedID = nil
+        }
+        if selectedID == nil {
+            selectedID = new.first
         }
     }
 }

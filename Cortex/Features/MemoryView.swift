@@ -58,6 +58,10 @@ struct MemoryView: View {
             emptyIcon: ConfigKind.memory.icon,
             emptyTitle: "No memory selected",
             emptyMessage: "Pick a memory file to read its contents.",
+            // Zero memory files at all (not merely filtered out): whole-pane empty state.
+            sourceIsEmpty: model.config.memories.isEmpty,
+            zeroDataTitle: "No memory files yet",
+            zeroDataMessage: "Memory files created by your tools show up here.",
             // ⌘C copies the memory file path.
             actions: { item in
                 PageActions(copyPath: { model.copyPath(item.path) })

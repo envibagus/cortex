@@ -57,6 +57,10 @@ struct ToolsView: View {
             emptyIcon: "server.rack",
             emptyTitle: "No MCP server selected",
             emptyMessage: "Pick a server on the left to see its transport, scope, and connection details.",
+            // Zero servers at all (not merely filtered out): whole-pane empty state.
+            sourceIsEmpty: model.config.mcpServers.isEmpty,
+            zeroDataTitle: "No MCP servers yet",
+            zeroDataMessage: "Add servers to your tools' MCP configs to see them here.",
             // ⌘C copies the server's launch command (stdio) or endpoint URL.
             actions: { server in
                 PageActions(copyPath: { model.copyPath(server.command ?? server.url ?? "") })

@@ -57,6 +57,10 @@ struct PluginsView: View {
             emptyIcon: ConfigKind.plugin.icon,
             emptyTitle: "No plugins selected",
             emptyMessage: "Select a plugin on the left to see its details.",
+            // Zero plugins at all (not merely filtered out): whole-pane empty state.
+            sourceIsEmpty: model.config.plugins.isEmpty,
+            zeroDataTitle: "No plugins yet",
+            zeroDataMessage: "Plugins installed in your CLI tools show up here.",
             // ⌘C copies the plugin's install path (plugins aren't edited/deleted in-app).
             actions: { item in
                 PageActions(copyPath: { model.copyPath(item.path) })

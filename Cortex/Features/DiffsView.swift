@@ -387,24 +387,34 @@ private struct RepoChangesPane: View {
     @State private var files: [GitFileChange]?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                header
-                if let files {
-                    if files.isEmpty {
-                        CortexEmptyState(icon: "checkmark.seal", title: "No changes",
-                                         message: "This repo's working tree is clean now.")
-                    } else {
-                        VStack(spacing: 10) {
-                            ForEach(files) { FileChangeRow(repoPath: repo.path, change: $0) }
+        Group {
+            if let files, files.isEmpty {
+                // Clean tree: header pinned on top, the empty state centered in the
+                // remaining pane (inside the scroll layout below it would sit at the top).
+                VStack(alignment: .leading, spacing: 16) {
+                    header
+                    CortexEmptyState(icon: "checkmark.seal", title: "No changes",
+                                     message: "This repo's working tree is clean now.")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        header
+                        if let files {
+                            VStack(spacing: 10) {
+                                ForEach(files) { FileChangeRow(repoPath: repo.path, change: $0) }
+                            }
+                        } else {
+                            loading
                         }
                     }
-                } else {
-                    loading
+                    .padding(28)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .padding(28)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Theme.canvas)
         .task(id: repo.id) { await load() }

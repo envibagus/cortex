@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import AppKit
 
 // MARK: - SettingsView
 //
@@ -117,6 +118,7 @@ struct SettingsView: View {
                 menuBarBehaviorSection
                 menuBarIconSection
                 menuBarUsageSection
+                menuBarProvidersSection
                 menuBarLiveActivitySection
                 menuBarCompletionSoundSection
                 menuBarShortcutSection
@@ -260,11 +262,31 @@ struct SettingsView: View {
             }
             // Launch at login lives here (an app-level preference), not under Menu Bar.
             Toggle("Launch at login", isOn: launchAtLoginBinding)
+            // When macOS registers the login item in the "requires approval" state (common
+            // after the app's identity changes), the toggle is on but it won't run at login
+            // until the user approves it. Offer a one-click shortcut to the Login Items pane.
+            if model.launchAtLoginNeedsApproval {
+                Button("Approve Login Item in System Settings\u{2026}") {
+                    model.openLoginItemsSettings()
+                }
+            }
         } header: {
             Text("General")
         } footer: {
-            Text("System follows macOS; Light and Dark force a theme.")
-                .foregroundStyle(.secondary)
+            // Swap in the approval explainer while it is pending, otherwise the appearance note.
+            if model.launchAtLoginNeedsApproval {
+                Text("Cortex is registered to launch at login but needs approval in System Settings > General > Login Items.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("System follows macOS; Light and Dark force a theme.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        // Keep the pending-approval state fresh: re-check when the pane appears and each time
+        // the app reactivates (e.g. returning from System Settings after approving).
+        .onAppear { model.refreshLaunchAtLoginStatus() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refreshLaunchAtLoginStatus()
         }
     }
 
@@ -739,6 +761,27 @@ struct SettingsView: View {
             Text("Show percentages as used or left. Reset times show a countdown or a clock time. Auto refresh sets how often limits re-check.")
                 .foregroundStyle(.secondary)
         }
+    }
+
+    // Per-provider visibility in the menu-bar panel. At least one provider must stay on, so the
+    // last enabled toggle is disabled (can't be switched off).
+    private var menuBarProvidersSection: some View {
+        Section {
+            ForEach(UsageProviderID.allCases) { id in
+                Toggle(id.name, isOn: providerBinding(id))
+                    .disabled(model.isMenuBarProviderEnabled(id) && model.menuBarProviders.count == 1)
+            }
+        } header: {
+            Text("Providers")
+        } footer: {
+            Text("Choose which providers' usage shows in the menu-bar panel. A provider still only appears when it's set up. At least one stays on.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func providerBinding(_ id: UsageProviderID) -> Binding<Bool> {
+        Binding(get: { model.isMenuBarProviderEnabled(id) },
+                set: { model.setMenuBarProvider(id, enabled: $0) })
     }
 
     private var menuBarLiveActivitySection: some View {

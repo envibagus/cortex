@@ -32,7 +32,7 @@ targets:
       - package: SwiftDraw
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.cortex.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.cortex.mac
         PRODUCT_NAME: Cortex
         MARKETING_VERSION: "1.3.0"
         CURRENT_PROJECT_VERSION: 4

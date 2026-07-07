@@ -51,6 +51,7 @@ enum SummaryBackend: String, CaseIterable, Identifiable, Hashable {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.hasPrefix("You summarize a coding session")
             || t.hasPrefix("You summarize an AI coding-agent")
+            || t.hasPrefix("You summarize a command-line developer tool")
     }
 }
 
@@ -84,9 +85,10 @@ final class SummaryService {
     private enum Source: Sendable {
         case text(String)
         case sessionPrompts(URL)
+        case toolHelp(URL, name: String, blurb: String?)
     }
 
-    private enum Kind: Sendable { case agent, session }
+    private enum Kind: Sendable { case agent, session, tool }
 
     init() { load() }
 
@@ -222,6 +224,42 @@ final class SummaryService {
         startWorkerIfNeeded()
     }
 
+    // MARK: - Tool summaries
+    //
+    // A one-line, on-device description of what a command-line tool does, generated from
+    // its name + help output. Most useful for Uncatalogued tools (which carry no built-in
+    // description) but offered for any tool. Cached by tool name and lazy: requested only
+    // for the tool the user is viewing, and jumps the queue so it lands promptly.
+
+    private func toolKey(_ name: String) -> String { "tool:" + name }
+
+    /// The cached AI summary for a tool, or nil when not generated yet.
+    func toolSummary(for tool: DetectedTool) -> String? {
+        guard let cached = summaries[toolKey(tool.name)] else { return nil }
+        let text = cached.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    /// True while a tool summary is being generated (so the UI shows a placeholder).
+    func isSummarizingTool(_ name: String) -> Bool { inFlight.contains(toolKey(name)) }
+
+    /// Generate (once) a one-line description of an installed tool from its help output.
+    /// No-op when the model is unavailable or the tool isn't installed.
+    func ensureToolSummary(for tool: DetectedTool) {
+        guard isAvailable, tool.present, let path = tool.path else { return }
+        let key = toolKey(tool.name)
+        guard toolSummary(for: tool) == nil, !inFlight.contains(key) else { return }
+        inFlight.insert(key)
+        queue.insert(Pending(
+            key: key,
+            modified: 0,
+            source: .toolHelp(URL(fileURLWithPath: path), name: tool.name, blurb: tool.blurb),
+            kind: .tool,
+            backend: backend
+        ), at: 0)
+        startWorkerIfNeeded()
+    }
+
     // Drain the queue sequentially (one request at a time avoids the model's
     // concurrent-request / rate-limit errors), publishing each summary as it lands.
     private func startWorkerIfNeeded() {
@@ -252,6 +290,8 @@ final class SummaryService {
             input = text
         case .sessionPrompts(let url):
             input = await Task.detached(priority: .utility) { Self.extractPrompts(from: url) }.value
+        case .toolHelp(let url, let name, let blurb):
+            input = await Task.detached(priority: .utility) { Self.buildToolInput(url: url, name: name, blurb: blurb) }.value
         }
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 
@@ -268,10 +308,10 @@ final class SummaryService {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
             guard case .available = SystemLanguageModel.default.availability else { return nil }
-            let session = LanguageModelSession(instructions: kind == .session ? Self.sessionInstructions : Self.agentInstructions)
+            let session = LanguageModelSession(instructions: Self.instructions(for: kind))
             do {
                 let response = try await session.respond(to: input)
-                return Self.clean(response.content, oneLine: kind == .agent)
+                return Self.clean(response.content, oneLine: kind != .session)
             } catch {
                 return nil   // refusal / unavailable mid-run / etc. -> fall back to raw text
             }
@@ -289,9 +329,9 @@ final class SummaryService {
 
     private static func generateWithClaude(input: String, kind: Kind) async -> String? {
         guard let bin = claudeCLIPath else { return nil }
-        let instructions = kind == .session ? Self.sessionInstructions : Self.agentInstructions
+        let instructions = Self.instructions(for: kind)
         let prompt = instructions + "\n\nInput:\n" + input
-        let oneLine = kind == .agent
+        let oneLine = kind != .session
         return await Task.detached(priority: .utility) { () -> String? in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: bin)
@@ -326,6 +366,43 @@ final class SummaryService {
     sentences describing what the session was about and what was done. \
     No markdown, no preamble, no quotes.
     """
+
+    private static let toolInstructions = """
+    You summarize a command-line developer tool into ONE short line for a list UI. \
+    Given the tool's name and its help text, reply with a single plain sentence of at \
+    most 14 words saying what the tool does. No quotes, no markdown, no leading label, \
+    no trailing period.
+    """
+
+    /// The system prompt for each summary kind.
+    private static func instructions(for kind: Kind) -> String {
+        switch kind {
+        case .session: sessionInstructions
+        case .agent: agentInstructions
+        case .tool: toolInstructions
+        }
+    }
+
+    // Build the model input for a tool: its name, any known description, and the first
+    // chunk of its help output (read off-main). Only `--help` / `-h` are tried, so a tool
+    // that pages its help (e.g. `git help`) is never invoked in a way that could hang.
+    private nonisolated static func buildToolInput(url: URL, name: String, blurb: String?) -> String {
+        var parts = ["Tool: \(name)"]
+        if let blurb, !blurb.isEmpty { parts.append("Known description: \(blurb)") }
+        let help = extractHelp(url)
+        if !help.isEmpty { parts.append("Help output:\n\(help)") }
+        return parts.joined(separator: "\n")
+    }
+
+    private nonisolated static func extractHelp(_ url: URL) -> String {
+        for args in [["--help"], ["-h"]] {
+            let res = Shell.run(url, args)
+            let text = res.stdout.isEmpty ? res.stderr : res.stdout
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return String(trimmed.prefix(1500)) }
+        }
+        return ""
+    }
 
     // Pull the user prompts out of a session JSONL (reusing the replay parser) and join
     // the first several into one capped string - enough to capture the session's intent

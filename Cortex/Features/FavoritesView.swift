@@ -104,16 +104,22 @@ struct FavoritesView: View {
     }
 
     var body: some View {
-        Group {
-            // Whole-view empty state when there are no favorites at all.
-            if favorites.isEmpty {
-                FavoritesEmptyState()
-            } else {
-                splitBrowser
+        // The split browser stays mounted even with zero favorites; the whole-view
+        // empty state sits ON TOP as an opaque overlay. Swapping the split out (which
+        // unmounts its native List/scroll views and toolbar) triggered an AppKit
+        // re-layout that stranded the SIDEBAR's scroll offset up over the traffic
+        // lights - with an overlay, nothing is ever torn down.
+        splitBrowser
+            .overlay {
+                if favorites.isEmpty {
+                    FavoritesEmptyState()
+                }
             }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.canvas)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.canvas)
+            // ONE page chrome for both states, applied outside the overlay.
+            .cortexScrollEdge()
+            .cortexPageChrome("Favorites", subtitle: "Everything you've starred", count: filtered.count)
         // Native new-collection alert with a TextField + create button. Triggered from
         // either the row context menu or the detail toolbar menu; on create the pending
         // item (if any) is added to the new collection.
@@ -129,12 +135,17 @@ struct FavoritesView: View {
     // MARK: Split browser
 
     private var splitBrowser: some View {
+        // No title here: the page chrome lives at the body level (outside the
+        // empty-state swap), so this split renders only its core layout.
         SplitDetailView(
             items: filtered,
             selectedID: $selectedID,
-            title: "Favorites",
-            subtitle: "Everything you've starred",
-            count: filtered.count,
+            // No skeleton while the whole-pane empty state covers this split: the
+            // skeleton respects the top safe area but the real list extends under the
+            // band, so the 0.3s skeleton flip resized the pane and visibly slid the
+            // centered empty state down. With zero favorites the real layout is
+            // trivially cheap, so it builds immediately and the size never changes.
+            showSkeleton: !favorites.isEmpty,
             emptyIcon: "star",
             emptyTitle: "No item selected",
             emptyMessage: "Select a favorite on the left to see its contents."
@@ -158,25 +169,9 @@ struct FavoritesView: View {
                 onNewCollection: { beginNewCollection(for: item.id) }
             )
         }
-        // When the search or kind chip filters out the current selection, fall back to
-        // the first remaining row so the detail pane never shows a stale item.
-        .onChange(of: query) { _, _ in
-            if let id = selectedID, !filtered.contains(where: { $0.id == id }) {
-                selectedID = filtered.first?.id
-            }
-        }
-        .onChange(of: kindFilter) { _, _ in
-            if let id = selectedID, !filtered.contains(where: { $0.id == id }) {
-                selectedID = filtered.first?.id
-            }
-        }
-        // If the visible selection gets unfavorited (from anywhere), drop it so the
-        // detail pane does not linger on a now-removed item.
-        .onChange(of: favorites.map(\.id)) { _, ids in
-            if let id = selectedID, !ids.contains(id) {
-                selectedID = filtered.first?.id
-            }
-        }
+        // Unfavoriting or filtering out the current selection is reconciled by
+        // SplitDetailView itself: it moves the selection to the neighboring row
+        // (next item, or the new last row), so no fallback handlers are needed here.
     }
 
     // MARK: Shared item context menu
@@ -401,7 +396,7 @@ private struct FavoriteItemRow: View {
             Spacer(minLength: 8)
 
             // Favorite marker (always favorited in this list)
-            Image(systemName: "star")
+            Image(systemName: "star.fill")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
 
@@ -577,12 +572,12 @@ private struct FavoriteItemDetail: View {
             // Preview / source segmented toggle (eye vs code glyphs)
             PreviewSourceToggle(showSource: $showSource)
 
-            // Star toggle for the current item
+            // Star toggle for the current item: filled while favorited.
             Button {
                 model.toggleFavorite(item.id)
             } label: {
                 let on = model.library.isFavorite(item.id)
-                Image(systemName: "star")
+                Image(systemName: on ? "star.fill" : "star")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(on ? Theme.textPrimary : Theme.textSecondary)
             }

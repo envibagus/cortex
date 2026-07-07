@@ -131,6 +131,26 @@ struct CortexApp: App {
 // already just closes the window, leaving the menu bar - no prompt needed there.
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Refuse to run a second instance. Two processes sharing this bundle id each register
+    /// a menu-bar status item for it, and that collision corrupts macOS's menu-bar
+    /// placement for the app - the item can end up parked off-screen until the next login.
+    /// If another instance is already running, hand off to it and quit before any UI or
+    /// status item is created. The kill(pid, 0) probe confirms the other process is truly
+    /// alive at the kernel level, so a stale entry can never make a fresh launch quit itself.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != me && !$0.isTerminated && kill($0.processIdentifier, 0) == 0 }
+        if let existing = others.first {
+            existing.activate(options: [.activateAllWindows])
+            // exit, not NSApp.terminate: terminate routes through applicationShouldTerminate,
+            // whose "Keep in Menu Bar" prompt would cancel termination and let this duplicate
+            // instance keep running - the exact collision this guard exists to prevent.
+            exit(0)
+        }
+    }
+
     /// Clicking the dock icon (or `open`-ing the app) with no window reopens the main
     /// window via the captured openWindow action, which reliably re-runs bootstrap and
     /// reloads the data freed on close.

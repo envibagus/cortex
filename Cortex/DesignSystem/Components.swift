@@ -912,17 +912,23 @@ private struct MultiSelectPopover: View {
 // so they all line up exactly.
 enum FilterControl { static let height: CGFloat = 36 }
 
-// The scope pill: shows the active scope and opens a searchable popover of scopes.
-private struct ScopeFilterButton: View {
+// The scope pill: shows the active scope and opens a searchable popover of scopes. Reused
+// across the app's filter rows (library scopes, the Environment install-source filter);
+// the "all" label, search prompt, and per-row icon are parameterized so each caller reads
+// naturally while sharing one look and behavior.
+struct ScopeFilterButton: View {
     @Binding var scope: String?
     let scopes: [String]
+    var allLabel: String = "All scopes"
+    var prompt: String = "Filter scopes"
+    var rowIcon: (String) -> String = { $0 == "Global" ? "globe" : "folder" }
     @State private var open = false
 
     var body: some View {
         Button { open = true } label: {
             HStack(spacing: 6) {
                 Image(systemName: "line.3.horizontal.decrease.circle")
-                Text(scope ?? "All scopes").lineLimit(1)
+                Text(scope ?? allLabel).lineLimit(1)
                 Spacer(minLength: 4)
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 9, weight: .semibold))
             }
@@ -937,7 +943,8 @@ private struct ScopeFilterButton: View {
         // Liquid Glass pill (matches the sort button + the rest of the app's glass).
         .glassPill()
         .popover(isPresented: $open, arrowEdge: .bottom) {
-            ScopePopover(scope: $scope, scopes: scopes) { open = false }
+            ScopePopover(scope: $scope, scopes: scopes, allLabel: allLabel, prompt: prompt,
+                         rowIcon: rowIcon) { open = false }
         }
     }
 }
@@ -945,9 +952,12 @@ private struct ScopeFilterButton: View {
 // A small command-palette-style popover: a search field over a scrollable, live-
 // filtered list of scopes (All scopes + Global + each project). Picking one applies
 // it and dismisses. Scales to 100s of project scopes where chips/menus do not.
-private struct ScopePopover: View {
+struct ScopePopover: View {
     @Binding var scope: String?
     let scopes: [String]
+    var allLabel: String = "All scopes"
+    var prompt: String = "Filter scopes"
+    var rowIcon: (String) -> String = { $0 == "Global" ? "globe" : "folder" }
     let dismiss: () -> Void
     @State private var query = ""
     @FocusState private var focused: Bool
@@ -964,7 +974,7 @@ private struct ScopePopover: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Theme.textSecondary)
-                TextField("Filter scopes", text: $query)
+                TextField(prompt, text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14))
                     .foregroundStyle(Theme.textPrimary)
@@ -977,9 +987,9 @@ private struct ScopePopover: View {
 
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    scopeRow(label: "All scopes", icon: "square.grid.2x2", value: nil)
+                    scopeRow(label: allLabel, icon: "square.grid.2x2", value: nil)
                     ForEach(filtered, id: \.self) { value in
-                        scopeRow(label: value, icon: value == "Global" ? "globe" : "folder", value: value)
+                        scopeRow(label: value, icon: rowIcon(value), value: value)
                     }
                 }
                 .padding(.vertical, 4)

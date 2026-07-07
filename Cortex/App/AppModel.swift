@@ -136,6 +136,7 @@ final class AppModel {
             case .ports: await ports.load()
             case .live, .sessions, .readout: await sessions.load(); recomputeStats()
             case .usage: if usage.hasLoaded { await usage.refresh() }
+            case .environment: await environment.load(force: true)
             default: await refreshAll(); return
             }
             showToast("Rescanned")
@@ -439,6 +440,31 @@ final class AppModel {
         didSet { UserDefaults.standard.set(menuBarConfetti, forKey: "menuBarConfetti") }
     }
 
+    /// Which usage providers show in the menu-bar panel, as UsageProviderID raw values. Default:
+    /// all. Persisted as [String]. At least one must stay enabled (see setMenuBarProvider), so the
+    /// panel is never empty. A stored (observed) property so toggling re-renders the panel live.
+    var menuBarProviders: Set<String> = {
+        if let saved = UserDefaults.standard.array(forKey: "menuBarProviders") as? [String], !saved.isEmpty {
+            return Set(saved)
+        }
+        return Set(UsageProviderID.allCases.map(\.id))
+    }() {
+        didSet { UserDefaults.standard.set(Array(menuBarProviders), forKey: "menuBarProviders") }
+    }
+
+    /// Whether a provider's usage section shows in the menu-bar panel.
+    func isMenuBarProviderEnabled(_ id: UsageProviderID) -> Bool { menuBarProviders.contains(id.id) }
+
+    /// Show/hide a provider in the menu-bar panel. Refuses to hide the LAST enabled provider, so
+    /// at least one always shows.
+    func setMenuBarProvider(_ id: UsageProviderID, enabled: Bool) {
+        if enabled {
+            menuBarProviders.insert(id.id)
+        } else if menuBarProviders.count > 1 {
+            menuBarProviders.remove(id.id)
+        }
+    }
+
     // Global hotkey to toggle the panel, stored as a Carbon virtual keycode + modifier
     // mask. keyCode -1 means "unset" (keyCode 0 is a valid key).
     private var hotKeyCodeRaw: Int = (UserDefaults.standard.object(forKey: "menuBarHotKeyCode") as? Int) ?? -1 {
@@ -458,20 +484,54 @@ final class AppModel {
         }
     }
 
-    /// Whether the app is registered to launch at login (reads the live service status).
+    /// Whether the app is registered to launch at login. Treats `.requiresApproval` as on:
+    /// once the user asks for it the item IS registered, it just needs a one-time approval in
+    /// System Settings (the state macOS puts a newly registered item in - notably after the
+    /// app's bundle identity changes). That pending state is surfaced by
+    /// `launchAtLoginNeedsApproval` rather than snapping the toggle back off.
     var menuBarLaunchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
+        get {
+            switch SMAppService.mainApp.status {
+            case .enabled, .requiresApproval: return true
+            default: return false
+            }
+        }
         set { setLaunchAtLogin(newValue) }
     }
 
+    /// True while the login item is registered but still needs the user to approve it in
+    /// System Settings > General > Login Items. SMAppService's status is a system call (not
+    /// observable), so it is snapshot here at the moments it can change and read by the UI.
+    private(set) var launchAtLoginNeedsApproval = false
+
+    /// Re-read the login-item service status into `launchAtLoginNeedsApproval` (call when the
+    /// Settings pane appears and when the app reactivates, so the hint clears once approved).
+    func refreshLaunchAtLoginStatus() {
+        launchAtLoginNeedsApproval = SMAppService.mainApp.status == .requiresApproval
+    }
+
+    /// Open System Settings > General > Login Items so the user can approve (or remove) the
+    /// login item, then re-check the status.
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+        refreshLaunchAtLoginStatus()
+    }
+
     /// Register / unregister the app as a login item, surfacing failures as a toast
-    /// (unsigned builds can't register; that is expected).
+    /// (unsigned builds can't register; that is expected). When enabling leaves the item in
+    /// the "requires approval" state, point the user to System Settings and open the Login
+    /// Items pane so toggling it actually takes effect.
     func setLaunchAtLogin(_ on: Bool) {
         do {
             if on { try SMAppService.mainApp.register() }
             else { try SMAppService.mainApp.unregister() }
         } catch {
             showToast("Couldn't update Launch at Login")
+        }
+        refreshLaunchAtLoginStatus()
+        if on && launchAtLoginNeedsApproval {
+            showToast("Approve Cortex in System Settings > Login Items")
+            SMAppService.openSystemSettingsLoginItems()
         }
     }
 
@@ -576,11 +636,12 @@ final class AppModel {
         usageLoop = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { break }
-                // After a loud probe failure, retry soon (so a network blip / rate-limit
-                // doesn't leave the gauge stale for a full interval); otherwise wait the
-                // configured interval.
-                let full = Double(self.menuBarRefreshInterval.rawValue)
-                let secs = self.usage.claudeTransientlyFailing ? min(full, 30) : full
+                // Always wait the full configured interval, even after a failure. The usage
+                // endpoint returns 503/429 when RATE-LIMITED, so fast-retrying on failure (the
+                // old min(full, 30) path) just kept it rate-limited in a feedback loop and the
+                // 503 never cleared. Backing off the full interval lets the limit clear so the
+                // next probe succeeds. Trade-off: a genuine network blip waits one full interval.
+                let secs = Double(self.menuBarRefreshInterval.rawValue)
                 try? await Task.sleep(for: .seconds(secs))
                 guard !Task.isCancelled else { break }
                 if self.usage.hasLoaded { await self.usage.refresh() }
@@ -623,6 +684,9 @@ final class AppModel {
     let hygieneScanner = HygieneScanner()
     let library = LibraryStore()
     let usage = UsageService()
+    // Installed developer command-line tools (Environment page). Scanned lazily the first
+    // time the page appears, never at bootstrap (resolving ~60 tools spawns a process each).
+    let environment = EnvironmentScanner()
     // Live "what is Claude Code doing now" signal for the menu bar (off until enabled).
     let activity = ActivityService()
     // Live progress of running dynamic workflows (N/M subagents done) for the menu bar.
@@ -792,6 +856,9 @@ final class AppModel {
         // Re-probe live usage too, but only once it has been opened (avoids a
         // surprise Keychain access prompt on a plain ⌘R before the user visits Usage).
         if usage.hasLoaded { await usage.refresh() }
+        // Rescan installed tools only if the Environment page has been opened, so a plain
+        // ⌘R never pays for the ~60-process scan before the user has visited it.
+        if environment.hasLoaded { await environment.load(force: true) }
         recomputeStats()
         await loadHygiene()
         summaries.ensureSummaries(for: config.agents)
@@ -916,6 +983,17 @@ final class AppModel {
     func toggleFavorite(_ id: String) {
         library.toggleFavorite(id)
         showToast(library.isFavorite(id) ? "Added to Favorites" : "Removed from Favorites")
+    }
+
+    /// Favorited ids that resolve to a CURRENT item (config item, MCP server, memory
+    /// file, or hook). The raw favorites set can hold stale ids (deleted or renamed
+    /// files), so the sidebar badge counts THIS, matching what the Favorites page
+    /// actually lists.
+    var resolvedFavoritesCount: Int {
+        config.items.filter { library.isFavorite($0.id) }.count
+            + config.mcpServers.filter { library.isFavorite($0.id) }.count
+            + config.memories.filter { library.isFavorite($0.id) }.count
+            + config.hooks.filter { library.isFavorite($0.id) }.count
     }
 
     /// Toggle collection membership and confirm with a toast naming the collection.

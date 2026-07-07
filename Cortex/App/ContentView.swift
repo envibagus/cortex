@@ -31,6 +31,24 @@ struct ContentView: View {
         .onAppear { model.openMainWindow = { openWindow(id: "main") } }
     }
 
+    // Whether the CURRENT route lands on a whole-pane empty state (its only content is
+    // a centered empty state), in which case the page-enter transition drops the zoom.
+    private var sparseLanding: Bool {
+        switch model.route {
+        case .favorites: model.resolvedFavoritesCount == 0
+        case .collections: model.library.collections.isEmpty
+        case .skills: model.config.skills.isEmpty
+        case .agents: model.config.agents.isEmpty
+        case .rules: model.config.rules.isEmpty
+        case .commands: model.config.commands.isEmpty
+        case .tools: model.config.mcpServers.isEmpty
+        case .plugins: model.config.plugins.isEmpty
+        case .memory: model.config.memories.isEmpty
+        case .instructions: model.config.instructions.isEmpty
+        default: false
+        }
+    }
+
     // The main two-column shell plus the ⌘K command palette overlay.
     private var mainShell: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -47,7 +65,12 @@ struct ContentView: View {
                     // top content start inset and slide up on entry - the "weird margin"
                     // wobble, worst on Repos. Anchored to the top, the header stays put and the
                     // page just grows downward. Kept subtle (0.97).
-                    .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                    // Sparse landings (a whole-pane centered empty state and nothing else) skip
+                    // the scale: with a single element far below the top anchor, the zoom reads
+                    // as the empty state sliding down a few points instead of a page zoom.
+                    .transition(sparseLanding
+                        ? .opacity
+                        : .opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .animation(.easeOut(duration: 0.32), value: model.route)
@@ -268,11 +291,13 @@ struct SidebarView: View {
         case .commands: model.config.commands.count
         case .plugins: model.config.plugins.count
         case .instructions: model.config.instructions.count
-        case .favorites: model.library.favorites.count
+        case .favorites: model.resolvedFavoritesCount
         case .collections: model.library.collections.count
         case .memory: model.config.memories.count
         case .hooks: model.config.hooks.count
         case .diffs: model.repos.repos.filter(\.isDirty).count   // repos with uncommitted changes
+        // Present-tool count, once the lazy scan has run (0/hidden until the page is first opened).
+        case .environment: model.environment.hasLoaded ? model.environment.presentCount : nil
         default: nil
         }
         guard let count, count > 0 else { return nil }
@@ -336,6 +361,7 @@ struct DetailRouter: View {
         case .repoPulse: RepoPulseView()
         case .diffs: DiffsView()
         case .snapshots: SnapshotsView()
+        case .environment: EnvironmentView()
         case .skills: SkillsView()
         case .agents: AgentsView()
         case .rules: RulesView()

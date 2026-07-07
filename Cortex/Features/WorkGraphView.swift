@@ -23,6 +23,8 @@ struct WorkGraphView: View {
             || !model.sessions.sessions.isEmpty
             || !model.repos.repos.isEmpty
 
+        // ONE scaffold for both branches (branch-owned chrome would tear the band
+        // toolbar down when the data arrives, disturbing the sidebar's top inset).
         PageScaffold(
             title: "Work Graph",
             subtitle: "Everything in your stack, charted on one page.",
@@ -34,6 +36,13 @@ struct WorkGraphView: View {
                     title: "No data yet",
                     message: "As you run sessions and set up repos, the graphs fill in here."
                 )
+                .frame(maxWidth: .infinity)
+                // Center in the scroll viewport: the scaffold's content is top-aligned
+                // scroll content, so size this sole child to the visible height (minus
+                // the scaffold's own vertical padding) and let the state center inside.
+                .containerRelativeFrame(.vertical) { length, _ in
+                    max(160, length - Theme.pageTopInset - Theme.pageHInset)
+                }
             } else {
                 VStack(alignment: .leading, spacing: 22) {
                     // Counts across every config surface
