@@ -63,10 +63,16 @@ struct MenuBarPanel: View {
             }
         }
 
-        // The other providers, each only when enabled AND it returned data. The primary (shown in
-        // the header) omits its own title.
-        for id in [UsageProviderID.codex, .cursor, .antigravity] where providerVisible(id) {
-            out.append(AnyView(providerSection(id, showTitle: id != primary)))
+        // Secondary providers appear only when enabled AND they returned data (avoid clutter).
+        // The primary non-Claude provider is ALWAYS rendered, even when not .ok, so the panel is
+        // never just a header with a floating refresh button - its title lives in the header, so
+        // it omits its own.
+        for id in [UsageProviderID.codex, .cursor, .antigravity] {
+            if id == primary {
+                out.append(AnyView(providerSection(id, showTitle: false)))
+            } else if providerVisible(id) {
+                out.append(AnyView(providerSection(id, showTitle: true)))
+            }
         }
         return out
     }
@@ -281,27 +287,33 @@ struct MenuBarPanel: View {
 
     // MARK: Non-Claude providers (Codex / Cursor / Antigravity), shown only when connected
 
-    /// One provider's section: (optionally) its name + plan pill over its usage rows. `showTitle`
-    /// is false for the primary provider, whose name already titles the panel header. Rendered
-    /// only for a provider whose probe returned `.ok` (callers gate on `providerVisible`).
+    /// One provider's section: (optionally) its name + plan pill over its body. `showTitle` is
+    /// false for the primary provider, whose name already titles the panel header. Secondary
+    /// providers reach here only when `.ok` (callers gate on `providerVisible`); the primary is
+    /// rendered in every state (loading / not configured / error / ok) so the panel is never a
+    /// bare header.
     @ViewBuilder private func providerSection(_ id: UsageProviderID, showTitle: Bool = true) -> some View {
-        if case let .ok(plan, metrics) = usage(id)?.result {
-            VStack(alignment: .leading, spacing: 12) {
-                if showTitle {
-                    HStack(spacing: 8) {
-                        Text(id.name)
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(Theme.textPrimary)
-                        if let plan, !plan.isEmpty {
-                            Pill(text: plan, tint: Theme.textSecondary)
-                        }
-                        Spacer()
+        let result = usage(id)?.result
+        VStack(alignment: .leading, spacing: 12) {
+            if showTitle {
+                HStack(spacing: 8) {
+                    Text(id.name)
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Theme.textPrimary)
+                    if case let .ok(plan, _) = result, let plan, !plan.isEmpty {
+                        Pill(text: plan, tint: Theme.textSecondary)
                     }
+                    Spacer()
                 }
+            }
+            switch result {
+            case .loading, .none:
+                HStack { ProgressView().controlSize(.small); Text("Loading usage\u{2026}").font(.caption).foregroundStyle(Theme.textSecondary) }
+            case let .ok(_, metrics):
                 if metrics.isEmpty {
                     // Antigravity exposes quota only after the user sends it messages, so an empty
-                    // result means it's installed with nothing to report yet. Hint at that instead
-                    // of an empty section.
+                    // result means it's installed with nothing to report yet. Other providers
+                    // simply have no active limits right now.
                     if id == .antigravity {
                         HStack(spacing: 6) {
                             Image(systemName: "bubble.left.and.bubble.right")
@@ -311,10 +323,16 @@ struct MenuBarPanel: View {
                                 .font(.caption)
                                 .foregroundStyle(Theme.textSecondary)
                         }
+                    } else {
+                        note("checkmark.circle", "No active limits right now.")
                     }
                 } else {
                     ForEach(panelMetrics(metrics)) { UsageMiniRow(metric: $0) }
                 }
+            case let .notConfigured(message):
+                note("minus.circle", message)
+            case let .error(message):
+                note("exclamationmark.circle", message, tint: Theme.orange)
             }
         }
     }

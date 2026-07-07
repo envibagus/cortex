@@ -31,6 +31,7 @@ final class EnvironmentScanner {
 
     /// Run the scan off-main. No-op if already loaded unless `force` is set (refresh).
     func load(force: Bool = false) async {
+        if isLoading { return }            // a scan is already running; don't start a second
         if hasLoaded && !force { return }
         isLoading = true
         let known = Set(ToolCatalog.all.flatMap { [$0.name] + $0.aliases })
@@ -104,7 +105,9 @@ final class EnvironmentScanner {
     /// Run a resolved binary's version command and pull the version number out of the
     /// output. Some tools print their version to stderr, so both streams are considered.
     nonisolated static func readVersion(_ url: URL, args: [String] = ["--version"]) -> (version: String?, raw: String?) {
-        let res = Shell.run(url, args)
+        // Short timeout: a well-behaved tool prints its version instantly, so a slow one is
+        // almost certainly misbehaving and shouldn't stall the whole (parallel) scan.
+        let res = Shell.run(url, args, timeout: 10)
         let combined = res.stdout.isEmpty ? res.stderr : res.stdout
         let raw = firstNonEmptyLine(res.stdout) ?? firstNonEmptyLine(res.stderr)
         return (parseVersion(from: combined), raw)

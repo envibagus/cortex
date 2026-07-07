@@ -1,4 +1,5 @@
 import Foundation
+import Darwin   // kill / SIGKILL for the run() watchdog
 
 // MARK: - Shell
 //
@@ -105,15 +106,35 @@ enum Shell {
         let out = Pipe(), err = Pipe()
         proc.standardOutput = out
         proc.standardError = err
+        // Hand the child an immediate EOF on stdin so a tool that reads input (some print a
+        // usage prompt and then wait for one) can't block forever waiting for it.
+        proc.standardInput = FileHandle.nullDevice
 
         do { try proc.run() } catch {
             return Result(stdout: "", stderr: error.localizedDescription, exitCode: -1)
         }
 
-        // Read concurrently so a full stderr pipe cannot deadlock the child.
+        // Watchdog: a tool that never exits (infinite loop, network wait, or a pager on a
+        // non-tty) would otherwise hang this call forever. After `timeout`, SIGTERM it and
+        // escalate to SIGKILL if it ignores that. Killing the child closes its pipes, which
+        // unblocks the reads below, and it exits non-zero so callers see a failure not a hang.
+        // A scheduled timer (not a blocked thread), so this adds no load under heavy concurrency.
+        let watchdog = DispatchWorkItem {
+            guard proc.isRunning else { return }
+            proc.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+
+        // Read stdout then stderr on the calling thread (no extra pool threads, so many concurrent
+        // callers can't starve the global queue). Version/help output is tiny, so this won't
+        // deadlock in practice; the watchdog is the backstop for a child that fills a pipe buffer.
         let outData = out.fileHandleForReading.readDataToEndOfFile()
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
+        watchdog.cancel()
 
         return Result(
             stdout: String(data: outData, encoding: .utf8) ?? "",
